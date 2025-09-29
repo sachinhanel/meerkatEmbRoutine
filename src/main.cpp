@@ -21,6 +21,9 @@
 #include <Adafruit_Sensor.h>
 #include <ArduinoJson.h>
 
+//brings in config.h and its def also
+#include "DataCollector.h"
+#include "CommProtocol.h"
 // ====================================================================
 // CONFIGURATION AND CONSTANTS
 // ====================================================================
@@ -94,56 +97,14 @@
 // DATA STRUCTURES
 // ====================================================================
 
-typedef struct {
-    uint32_t timestamp;
-    int16_t rssi;
-    float snr;
-    uint8_t data_length;
-    uint8_t data[MAX_PACKET_SIZE];
-} LoRaPacket_t;
-
-typedef struct {
-    uint32_t timestamp;
-    int16_t rssi;
-    uint8_t data_length;
-    uint8_t data[MAX_PACKET_SIZE];
-} Radio433Packet_t;
-
-typedef struct {
-    uint32_t timestamp;
-    float pressure_hpa;
-    float temperature_c;
-    float altitude_m;
-} BarometerData_t;
-
-typedef struct {
-    uint32_t timestamp;
-    float current_a;
-    float voltage_v;
-    float power_w;
-} CurrentData_t;
-
-typedef struct {
-    bool lora_online;
-    bool radio433_online;
-    bool barometer_online;
-    bool current_sensor_online;
-    bool pi_connected;
-    uint32_t uptime_seconds;
-    uint16_t packet_count_lora;
-    uint16_t packet_count_433;
-} SystemStatus_t;
-
-typedef enum {
-    WAIT_FOR_HELLO,
-    WAIT_FOR_COMMAND,
-    WAIT_FOR_GOODBYE,
-    SENDING_RESPONSE
-} CommState_t;
 
 // ====================================================================
 // GLOBAL VARIABLES
 // ====================================================================
+
+
+DataCollector dataCollector;
+CommProtocol commProtocol(&dataCollector, &Serial);  
 
 // Sensor Hardware Objects
 SX1278 radio433Module(new Module(RADIO433_CS_PIN, RADIO433_DIO0_PIN, RADIO433_RST_PIN));
@@ -165,10 +126,6 @@ uint16_t loraPacketCount = 0, radio433PacketCount = 0;
 SystemStatus_t systemStatus;
 uint32_t bootTime = 0;
 
-// Communication State
-CommState_t commState = WAIT_FOR_HELLO;
-uint8_t receivedCommand = 0;
-uint32_t lastActivityTime = 0;
 
 // Sensor Status
 bool loraInitialized = false;
@@ -210,7 +167,9 @@ void initializeLoRa();
 void initializeRadio433();
 void initializeBarometer();
 void initializeCurrentSensor();
-void initializeCommunication();
+
+
+
 
 void dataCollectionTask(void* parameters);
 void communicationTask(void* parameters);
@@ -220,7 +179,7 @@ void checkLoRaPackets();
 void checkRadio433Packets();
 void updateBarometer();
 void updateCurrentSensor();
-void processCommProtocol();
+
 
 void addLoRaPacket(const LoRaPacket_t& packet);
 void addRadio433Packet(const Radio433Packet_t& packet);
@@ -232,10 +191,6 @@ bool getCurrentDataJSON(DynamicJsonDocument& doc);
 bool getAllDataJSON(DynamicJsonDocument& doc);
 bool getSystemStatusJSON(DynamicJsonDocument& doc);
 
-void processCommand(uint8_t command);
-void sendResponse(const String& response);
-void sendErrorResponse(const String& error);
-void resetCommState();
 
 void handleSerialCommands();
 void printWelcomeMessage();
@@ -266,7 +221,7 @@ void setup() {
     initializeRadio433();
     initializeBarometer();
     initializeCurrentSensor();
-    initializeCommunication();
+    
     
     // Initialize system status
     bootTime = millis();
@@ -296,7 +251,7 @@ void loop() {
 
 void setupSerial() {
     Serial.begin(115200);
-    while (!Serial) delay(10);
+    while (!Serial) delay(10); //wait for usb serial to be ready
     delay(1000);
     Serial.println();
 }
@@ -380,12 +335,7 @@ void initializeCurrentSensor() {
     Serial.println("CurrentSensor: Initialized successfully");
 }
 
-void initializeCommunication() {
-    piSerial.begin(PI_UART_BAUD, SERIAL_8N1, PI_UART_RX, PI_UART_TX);
-    piSerial.setTimeout(100);
-    resetCommState();
-    Serial.printf("CommProtocol: UART communication initialized at %d baud\n", PI_UART_BAUD);
-}
+
 
 // ====================================================================
 // FREERTOS TASKS
@@ -421,7 +371,7 @@ void dataCollectionTask(void* parameters) {
 
 void communicationTask(void* parameters) {
     while (true) {
-        processCommProtocol();
+        commProtocol.process();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -567,115 +517,10 @@ void addRadio433Packet(const Radio433Packet_t& packet) {
 
 // ====================================================================
 // COMMUNICATION PROTOCOL
-// ====================================================================
+// =================================================================++
 
-void processCommProtocol() {
-    // Timeout check
-    if (commState != WAIT_FOR_HELLO && 
-        (millis() - lastActivityTime > PI_COMM_TIMEOUT)) {
-        resetCommState();
-        return;
-    }
-    
-    while (piSerial.available()) {
-        uint8_t receivedByte = piSerial.read();
-        lastActivityTime = millis();
-        
-        switch (commState) {
-            case WAIT_FOR_HELLO:
-                if (receivedByte == HELLO_BYTE) {
-                    commState = WAIT_FOR_COMMAND;
-                }
-                break;
-                
-            case WAIT_FOR_COMMAND:
-                receivedCommand = receivedByte;
-                commState = WAIT_FOR_GOODBYE;
-                break;
-                
-            case WAIT_FOR_GOODBYE:
-                if (receivedByte == GOODBYE_BYTE) {
-                    processCommand(receivedCommand);
-                } else {
-                    sendErrorResponse("Invalid packet format");
-                }
-                resetCommState();
-                break;
-                
-            case SENDING_RESPONSE:
-                resetCommState();
-                break;
-        }
-    }
-}
 
-void processCommand(uint8_t command) {
-    DynamicJsonDocument doc(2048); // Adjust size as needed
-    String jsonResponse;
-    bool success = false;
-    
-    switch (command) {
-        case CMD_GET_LORA_DATA:
-            success = getLoRaDataJSON(doc);
-            break;
-        case CMD_GET_433_DATA:
-            success = getRadio433DataJSON(doc);
-            break;
-        case CMD_GET_BAROMETER_DATA:
-            success = getBarometerDataJSON(doc);
-            break;
-        case CMD_GET_CURRENT_DATA:
-            success = getCurrentDataJSON(doc);
-            break;
-        case CMD_GET_ALL_DATA:
-            success = getAllDataJSON(doc);
-            break;
-        case CMD_GET_STATUS:
-            success = getSystemStatusJSON(doc);
-            break;
-        default:
-            sendErrorResponse("Unknown command");
-            return;
-    }
-    
-    if (success) {
-        serializeJson(doc, jsonResponse);
-        sendResponse(jsonResponse);
-    } else {
-        sendErrorResponse("Failed to process command");
-    }
-}
-
-void sendResponse(const String& response) {
-    commState = SENDING_RESPONSE;
-    
-    piSerial.write(HELLO_BYTE);
-    
-    uint16_t length = response.length();
-    piSerial.write(length & 0xFF);
-    piSerial.write((length >> 8) & 0xFF);
-    
-    piSerial.print(response);
-    piSerial.write(GOODBYE_BYTE);
-    piSerial.flush();
-    
-    Serial.printf("Response sent (%d bytes)\n", length);
-}
-
-void sendErrorResponse(const String& error) {
-    DynamicJsonDocument errorDoc(256);
-    errorDoc["error"] = error;
-    errorDoc["timestamp"] = millis();
-    
-    String errorResponse;
-    serializeJson(errorDoc, errorResponse);
-    sendResponse(errorResponse);
-}
-
-void resetCommState() {
-    commState = WAIT_FOR_HELLO;
-    receivedCommand = 0;
-}
+//Now handled in CommProtocol.cpp fully
 
 // ====================================================================
 // JSON DATA FUNCTIONS
@@ -864,7 +709,7 @@ void updateSystemStatus() {
     systemStatus.current_sensor_online = currentSensorInitialized;
     systemStatus.packet_count_lora = loraPacketCount;
     systemStatus.packet_count_433 = radio433PacketCount;
-    systemStatus.pi_connected = (millis() - lastActivityTime < 30000);
+    systemStatus.pi_connected = (millis() - commProtocol.getLastActivityTime() < 30000);
 }
 
 void printSystemStatus() {

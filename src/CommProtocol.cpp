@@ -1,7 +1,7 @@
 #include "CommProtocol.h"
 #include <ArduinoJson.h>
 
-CommProtocol::CommProtocol(DataCollector* collector) : 
+CommProtocol::CommProtocol(DataCollector* collector, Stream* serial) : 
     data_collector(collector),
     current_state(WAIT_FOR_HELLO),
     received_peripheral_id(0),
@@ -11,7 +11,7 @@ CommProtocol::CommProtocol(DataCollector* collector) :
     hello_received_time(0),
     response_index(0) {
     
-    serial_port = &Serial2; // Use Serial2 for Pi communication
+    //serial_port = &Serial; // Use Serial2 for Pi communication
     memset(message_buffer, 0, sizeof(message_buffer));
 }
 
@@ -20,22 +20,16 @@ CommProtocol::~CommProtocol() {
 }
 
 bool CommProtocol::begin() {
-    // Initialize UART communication with Raspberry Pi
-    serial_port->begin(PI_UART_BAUD, SERIAL_8N1, PI_UART_RX, PI_UART_TX);
-    serial_port->setTimeout(100); // 100ms timeout for reads
     
+    serial_port->setTimeout(100);
     resetState();
     
-    Serial.println("CommProtocol: UART communication initialized");
-    Serial.printf("CommProtocol: Listening on Serial2 at %d baud\n", PI_UART_BAUD);
-    
+    Serial.println("CommProtocol: USB Serial communication initialized");
     return true;
 }
 
 void CommProtocol::end() {
-    if (serial_port) {
-        serial_port->end();
-    }
+
 }
 
 void CommProtocol::process() {
@@ -115,6 +109,27 @@ void CommProtocol::process() {
     }
 }
 
+void CommProtocol::processMessage(uint8_t peripheral_id, const uint8_t* message_data, uint8_t length) {
+    // Route message based on peripheral ID
+    if (peripheral_id == PERIPHERAL_ID_SYSTEM) {
+        // System commands are single-byte commands
+        if (length == 1) {
+            processSystemCommand(message_data[0]);
+        } else if (length == 0) {
+            // Some commands might have no payload (like GET_STATUS)
+            processSystemCommand(0);  // Or handle differently
+        } else {
+            Serial.printf("CommProtocol: Invalid system command length: %d\n", length);
+            sendErrorResponse("Invalid command length");
+        }
+    } 
+    else {
+        // Handle other peripheral IDs here in the future
+        Serial.printf("CommProtocol: Unknown peripheral ID: 0x%02X\n", peripheral_id);
+        sendErrorResponse("Unknown peripheral");
+    }
+}
+
 void CommProtocol::processSystemCommand(uint8_t command) {
     DynamicJsonDocument doc(1024);
     String json_response;
@@ -170,10 +185,10 @@ void CommProtocol::sendResponse(const String& response) {
     current_state = SENDING_RESPONSE;
     
     // Send HELLO byte
-    serial_port->write(HELLO_BYTE);
+    serial_port->write((uint8_t)HELLO_BYTE);
     
     // Send peripheral ID (system response)
-    serial_port->write(PERIPHERAL_ID_SYSTEM);
+    serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
     
     // Send response length
     uint8_t length = min((int)response.length(), 255);
@@ -185,7 +200,7 @@ void CommProtocol::sendResponse(const String& response) {
     }
     
     // Send GOODBYE byte
-    serial_port->write(GOODBYE_BYTE);
+    serial_port->write((uint8_t)GOODBYE_BYTE);
     
     // Flush the output buffer
     serial_port->flush();

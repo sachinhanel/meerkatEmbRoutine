@@ -3,35 +3,47 @@
 
 // Pin Definitions for ESP32-S3
 // SPI Pins (shared between LoRa and 433MHz modules)
-#define SPI_SCK_PIN     12
-#define SPI_MISO_PIN    13
-#define SPI_MOSI_PIN    11
+#define SPI_SCK_PIN     11
+#define SPI_MISO_PIN    12
+#define SPI_MOSI_PIN    13
+//_____
 
-// LoRa 915MHz Module Pins
-#define LORA_CS_PIN     10
-#define LORA_RST_PIN    9
-#define LORA_DIO0_PIN   8
+// LoRa 915MHz Module specific Pins
+#define LORA_CS_PIN     41
+#define LORA_RST_PIN    -1 //UNCONNECTED
+#define LORA_DIO0_PIN   40
 
-// 433MHz Radio Module Pins
-#define RADIO433_CS_PIN 7
-#define RADIO433_RST_PIN 6
-#define RADIO433_DIO0_PIN 5
+// 433MHz Radio Module specific Pins
+#define RADIO433_CS_PIN 42
+#define RADIO433_RST_PIN -1 //UNCONNECTED
+#define RADIO433_DIO0_PIN 39
 
 // Barometer Pins (I2C)
-#define I2C_SDA_PIN     1
-#define I2C_SCL_PIN     2
+#define I2C_SDA_PIN     9
+#define I2C_SCL_PIN     8
 
 // Current Sensor Pin (Analog)
-#define CURRENT_SENSOR_PIN 4
+#define CURRENT_SENSOR_PIN 10 // might be wrong
 
-// Raspberry Pi Communication Pins (UART)
-#define PI_UART_TX      43
-#define PI_UART_RX      44
-#define PI_UART_BAUD    115200
+// Raspberry Pi Communication  uses GPIO 19/20
+
+
+// #define PI_UART_TX      43
+// #define PI_UART_RX      44
+// #define PI_UART_BAUD    115200
+
+//OTHER DEVICES TO BE ADDED
+//1. ERROR LED, POWER LED
+//2. AIM BOARD COMMUNICATION PINS TO BACKPLANE
+//3. SD CARD
+//
+
+
+
 
 // Communication Protocol Constants
-#define HELLO_BYTE      0xAA
-#define GOODBYE_BYTE    0x55
+#define HELLO_BYTE      0x7E
+#define GOODBYE_BYTE    0x7F
 
 // Peripheral/Origin IDs
 #define PERIPHERAL_ID_SYSTEM        0x00

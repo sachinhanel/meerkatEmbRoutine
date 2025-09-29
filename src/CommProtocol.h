@@ -19,7 +19,7 @@ typedef enum {
 
 class CommProtocol {
 private:
-    HardwareSerial* serial_port;
+    Stream* serial_port;
     DataCollector* data_collector;
     
     CommState_t current_state;
@@ -42,7 +42,7 @@ private:
     void resetState();
     
 public:
-    CommProtocol(DataCollector* collector);
+    CommProtocol(DataCollector* collector, Stream* serial);
     ~CommProtocol();
     
     bool begin();
