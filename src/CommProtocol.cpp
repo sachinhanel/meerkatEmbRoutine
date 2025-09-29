@@ -1,4 +1,5 @@
 #include "CommProtocol.h"
+#include <ArduinoJson.h>
 
 CommProtocol::CommProtocol(DataCollector* collector) : 
     data_collector(collector),
@@ -114,8 +115,8 @@ void CommProtocol::process() {
     }
 }
 
-void CommProtocol::processCommand(uint8_t command) {
-    JsonDocument doc;
+void CommProtocol::processSystemCommand(uint8_t command) {
+    DynamicJsonDocument doc(1024);
     String json_response;
     bool success = false;
     
@@ -193,7 +194,7 @@ void CommProtocol::sendResponse(const String& response) {
 }
 
 void CommProtocol::sendErrorResponse(const String& error_message) {
-    JsonDocument error_doc;
+    DynamicJsonDocument error_doc(1024);
     error_doc["error"] = error_message;
     error_doc["timestamp"] = millis();
     
@@ -218,7 +219,7 @@ bool CommProtocol::isConnected() const {
 }
 
 void CommProtocol::sendTestMessage() {
-    JsonDocument test_doc;
+    DynamicJsonDocument test_doc(1024);
     test_doc["message"] = "ESP32 Ground Station Test";
     test_doc["timestamp"] = millis();
     test_doc["uptime"] = millis() / 1000;

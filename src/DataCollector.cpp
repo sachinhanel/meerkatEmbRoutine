@@ -117,7 +117,8 @@ void DataCollector::pollSensors() {
         updateSystemStatus();
         last_status_update = current_time;
     }
-}
+
+    
 
 void DataCollector::updateSystemStatus() {
     system_status.uptime_seconds = (millis() - boot_time) / 1000;

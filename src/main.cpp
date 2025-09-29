@@ -64,6 +64,10 @@
 #define CMD_GET_ALL_DATA        0x05
 #define CMD_GET_STATUS          0x06
 
+//i2c adresses for barometer
+#define BME280_ADDRESS_PRIMARY 0x76
+#define BME280_ADDRESS_ALTERNATE 0x77
+
 // Buffer Sizes
 #define LORA_BUFFER_SIZE        256
 #define RADIO433_BUFFER_SIZE    128
@@ -221,12 +225,12 @@ void processCommProtocol();
 void addLoRaPacket(const LoRaPacket_t& packet);
 void addRadio433Packet(const Radio433Packet_t& packet);
 
-bool getLoRaDataJSON(JsonDocument& doc);
-bool getRadio433DataJSON(JsonDocument& doc);
-bool getBarometerDataJSON(JsonDocument& doc);
-bool getCurrentDataJSON(JsonDocument& doc);
-bool getAllDataJSON(JsonDocument& doc);
-bool getSystemStatusJSON(JsonDocument& doc);
+bool getLoRaDataJSON(DynamicJsonDocument& doc);
+bool getRadio433DataJSON(DynamicJsonDocument& doc);
+bool getBarometerDataJSON(DynamicJsonDocument& doc);
+bool getCurrentDataJSON(DynamicJsonDocument& doc);
+bool getAllDataJSON(DynamicJsonDocument& doc);
+bool getSystemStatusJSON(DynamicJsonDocument& doc);
 
 void processCommand(uint8_t command);
 void sendResponse(const String& response);
@@ -365,7 +369,7 @@ void initializeBarometer() {
 }
 
 void initializeCurrentSensor() {
-    analogSetWidth(12);
+    analogReadResolution(12);
     analogSetAttenuation(ADC_11db);
     
     // Initialize sample arrays
@@ -606,7 +610,7 @@ void processCommProtocol() {
 }
 
 void processCommand(uint8_t command) {
-    JsonDocument doc;
+    DynamicJsonDocument doc(2048); // Adjust size as needed
     String jsonResponse;
     bool success = false;
     
@@ -659,7 +663,7 @@ void sendResponse(const String& response) {
 }
 
 void sendErrorResponse(const String& error) {
-    JsonDocument errorDoc;
+    DynamicJsonDocument errorDoc(256);
     errorDoc["error"] = error;
     errorDoc["timestamp"] = millis();
     
@@ -677,7 +681,7 @@ void resetCommState() {
 // JSON DATA FUNCTIONS
 // ====================================================================
 
-bool getLoRaDataJSON(JsonDocument& doc) {
+bool getLoRaDataJSON(DynamicJsonDocument& doc) {
     if (!loraInitialized) {
         doc["error"] = "LoRa module offline";
         return false;
@@ -686,8 +690,9 @@ bool getLoRaDataJSON(JsonDocument& doc) {
     doc["module"] = "LoRa_915MHz";
     doc["online"] = true;
     doc["packet_count"] = loraPacketCount;
-    doc["rssi"] = LoRa.rssi();
-    doc["snr"] = LoRa.snr();
+    doc["rssi"] = LoRa.packetRssi();
+    doc["snr"] = LoRa.packetSnr();
+    doc["current_channel_rssi"] = LoRa.rssi();    // Optional: live channel RSSI
     
     if (xSemaphoreTake(loraBufferMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         JsonArray packetsArray = doc["packets"].to<JsonArray>();
@@ -719,7 +724,7 @@ bool getLoRaDataJSON(JsonDocument& doc) {
     return true;
 }
 
-bool getRadio433DataJSON(JsonDocument& doc) {
+bool getRadio433DataJSON(DynamicJsonDocument& doc) {
     if (!radio433Initialized) {
         doc["error"] = "433MHz module offline";
         return false;
@@ -759,7 +764,7 @@ bool getRadio433DataJSON(JsonDocument& doc) {
     return true;
 }
 
-bool getBarometerDataJSON(JsonDocument& doc) {
+bool getBarometerDataJSON(DynamicJsonDocument& doc) {
     if (!barometerInitialized) {
         doc["error"] = "Barometer offline";
         return false;
@@ -782,7 +787,7 @@ bool getBarometerDataJSON(JsonDocument& doc) {
     return false;
 }
 
-bool getCurrentDataJSON(JsonDocument& doc) {
+bool getCurrentDataJSON(DynamicJsonDocument& doc) {
     if (!currentSensorInitialized) {
         doc["error"] = "Current sensor offline";
         return false;
@@ -805,38 +810,33 @@ bool getCurrentDataJSON(JsonDocument& doc) {
     return false;
 }
 
-bool getAllDataJSON(JsonDocument& doc) {
+bool getAllDataJSON(DynamicJsonDocument& doc) {
     doc["timestamp"] = millis();
     
-    JsonObject loraObj = doc["lora"].to<JsonObject>();
-    JsonDocument loraDoc;
+    DynamicJsonDocument loraDoc(2048);
     getLoRaDataJSON(loraDoc);
-    loraObj.set(loraDoc);
+    doc["lora"] = loraDoc.as<JsonObject>();
     
-    JsonObject radio433Obj = doc["radio433"].to<JsonObject>();
-    JsonDocument radio433Doc;
+    DynamicJsonDocument radio433Doc(2048);
     getRadio433DataJSON(radio433Doc);
-    radio433Obj.set(radio433Doc);
+    doc["radio433"] = radio433Doc.as<JsonObject>();
     
-    JsonObject baroObj = doc["barometer"].to<JsonObject>();
-    JsonDocument baroDoc;
+    DynamicJsonDocument baroDoc(2048);
     getBarometerDataJSON(baroDoc);
-    baroObj.set(baroDoc);
+    doc["barometer"] = baroDoc.as<JsonObject>();
     
-    JsonObject currentObj = doc["current"].to<JsonObject>();
-    JsonDocument currentDoc;
+    DynamicJsonDocument currentDoc(2048);
     getCurrentDataJSON(currentDoc);
-    currentObj.set(currentDoc);
+    doc["current"] = currentDoc.as<JsonObject>();
     
-    JsonObject statusObj = doc["status"].to<JsonObject>();
-    JsonDocument statusDoc;
+    DynamicJsonDocument statusDoc(2048);
     getSystemStatusJSON(statusDoc);
-    statusObj.set(statusDoc);
+    doc["status"] = statusDoc.as<JsonObject>();
     
     return true;
 }
 
-bool getSystemStatusJSON(JsonDocument& doc) {
+bool getSystemStatusJSON(DynamicJsonDocument& doc) {
     updateSystemStatus();
     
     doc["uptime_seconds"] = systemStatus.uptime_seconds;

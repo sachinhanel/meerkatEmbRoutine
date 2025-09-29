@@ -1,4 +1,5 @@
 #include "CurrentSensor.h"
+#include <Arduino.h>
 
 CurrentSensor::CurrentSensor() : 
     is_initialized(false), 
@@ -25,7 +26,7 @@ CurrentSensor::~CurrentSensor() {
 
 bool CurrentSensor::begin() {
     // Initialize ADC
-    analogSetWidth(12); // 12-bit resolution (0-4095)
+    //analogSetWidth(12); // 12-bit resolution (0-4095)    REENABLE LATER
     analogSetAttenuation(ADC_11db); // Full scale ~3.3V
     
     is_initialized = true;
