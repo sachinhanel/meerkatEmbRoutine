@@ -136,44 +136,129 @@ void CommProtocol::processSystemCommand(uint8_t command) {
     bool success = false;
     
     switch (command) {
-        case CMD_GET_LORA_DATA:
-            Serial.println("CommProtocol: Processing GET_LORA_DATA");
-            success = data_collector->getLoRaData(doc);
-            break;
-            
-        case CMD_GET_433_DATA:
-            Serial.println("CommProtocol: Processing GET_433_DATA");
-            success = data_collector->get433Data(doc);
-            break;
-            
-        case CMD_GET_BAROMETER_DATA:
-            Serial.println("CommProtocol: Processing GET_BAROMETER_DATA");
-            success = data_collector->getBarometerData(doc);
-            break;
-            
-        case CMD_GET_CURRENT_DATA:
-            Serial.println("CommProtocol: Processing GET_CURRENT_DATA");
-            success = data_collector->getCurrentData(doc);
-            break;
-            
-        case CMD_GET_ALL_DATA:
-            Serial.println("CommProtocol: Processing GET_ALL_DATA");
-            success = data_collector->getAllData(doc);
-            break;
-            
-        case CMD_GET_STATUS:
-            Serial.println("CommProtocol: Processing GET_STATUS");
-            success = data_collector->getSystemStatus(doc);
-            break;
-            
+        case CMD_GET_LORA_DATA: {
+            Serial.println("CommProtocol: Processing GET_LORA_DATA (binary)");
+            uint8_t buf[128];
+            size_t n = data_collector->packLoRaData(buf, sizeof(buf));
+            if (n > 0) {
+                // Send framed binary payload
+                current_state = SENDING_RESPONSE;
+                serial_port->write((uint8_t)HELLO_BYTE);
+                serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
+                serial_port->write((uint8_t)n);
+                serial_port->write(buf, n);
+                serial_port->write((uint8_t)GOODBYE_BYTE);
+                serial_port->flush();
+                Serial.printf("CommProtocol: Response sent (%d bytes)\n", (int)n);
+            } else {
+                sendErrorResponse("No LoRa data");
+            }
+            return;
+        }
+        case CMD_GET_433_DATA: {
+            Serial.println("CommProtocol: Processing GET_433_DATA (binary)");
+            uint8_t buf[128];
+            size_t n = data_collector->pack433Data(buf, sizeof(buf));
+            if (n > 0) {
+                current_state = SENDING_RESPONSE;
+                serial_port->write((uint8_t)HELLO_BYTE);
+                serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
+                serial_port->write((uint8_t)n);
+                serial_port->write(buf, n);
+                serial_port->write((uint8_t)GOODBYE_BYTE);
+                serial_port->flush();
+                Serial.printf("CommProtocol: Response sent (%d bytes)\n", (int)n);
+            } else {
+                sendErrorResponse("No 433 data");
+            }
+            return;
+        }
+        case CMD_GET_BAROMETER_DATA: {
+            Serial.println("CommProtocol: Processing GET_BAROMETER_DATA (binary)");
+            uint8_t buf[64];
+            size_t n = data_collector->packBarometerData(buf, sizeof(buf));
+            if (n > 0) {
+                current_state = SENDING_RESPONSE;
+                serial_port->write((uint8_t)HELLO_BYTE);
+                serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
+                serial_port->write((uint8_t)n);
+                serial_port->write(buf, n);
+                serial_port->write((uint8_t)GOODBYE_BYTE);
+                serial_port->flush();
+                Serial.printf("CommProtocol: Response sent (%d bytes)\n", (int)n);
+            } else {
+                sendErrorResponse("No barometer data");
+            }
+            return;
+        }
+        case CMD_GET_CURRENT_DATA: {
+            Serial.println("CommProtocol: Processing GET_CURRENT_DATA (binary)");
+            uint8_t buf[64];
+            size_t n = data_collector->packCurrentData(buf, sizeof(buf));
+            if (n > 0) {
+                current_state = SENDING_RESPONSE;
+                serial_port->write((uint8_t)HELLO_BYTE);
+                serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
+                serial_port->write((uint8_t)n);
+                serial_port->write(buf, n);
+                serial_port->write((uint8_t)GOODBYE_BYTE);
+                serial_port->flush();
+                Serial.printf("CommProtocol: Response sent (%d bytes)\n", (int)n);
+            } else {
+                sendErrorResponse("No current data");
+            }
+            return;
+        }
+        case CMD_GET_ALL_DATA: {
+            Serial.println("CommProtocol: Processing GET_ALL_DATA (binary)");
+            // Compact bundle: LoRa + 433 + Baro + Current, if size allows. Otherwise send error.
+            uint8_t buf[255];
+            size_t off = 0;
+            size_t n;
+            if ((n = data_collector->packLoRaData(buf + off, sizeof(buf) - off)) == 0) { /* ok if offline */ }
+            else off += n;
+            if ((n = data_collector->pack433Data(buf + off, sizeof(buf) - off)) == 0) { }
+            else off += n;
+            if ((n = data_collector->packBarometerData(buf + off, sizeof(buf) - off)) == 0) { }
+            else off += n;
+            if ((n = data_collector->packCurrentData(buf + off, sizeof(buf) - off)) == 0) { }
+            else off += n;
+            if (off == 0) { sendErrorResponse("No data"); return; }
+            current_state = SENDING_RESPONSE;
+            serial_port->write((uint8_t)HELLO_BYTE);
+            serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
+            serial_port->write((uint8_t)off);
+            serial_port->write(buf, off);
+            serial_port->write((uint8_t)GOODBYE_BYTE);
+            serial_port->flush();
+            Serial.printf("CommProtocol: Response sent (%d bytes)\n", (int)off);
+            return;
+        }
+        case CMD_GET_STATUS: {
+            Serial.println("CommProtocol: Processing GET_STATUS (binary)");
+            uint8_t buf[64];
+            size_t n = data_collector->packStatus(buf, sizeof(buf));
+            if (n > 0) {
+                current_state = SENDING_RESPONSE;
+                serial_port->write((uint8_t)HELLO_BYTE);
+                serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
+                serial_port->write((uint8_t)n);
+                serial_port->write(buf, n);
+                serial_port->write((uint8_t)GOODBYE_BYTE);
+                serial_port->flush();
+                Serial.printf("CommProtocol: Response sent (%d bytes)\n", (int)n);
+            } else {
+                sendErrorResponse("No status");
+            }
+            return;
+        }
         default:
             Serial.printf("CommProtocol: Unknown command: 0x%02X\n", command);
             sendErrorResponse("Unknown command");
             return;
     }
-    
+
     if (success) {
-        // Serialize JSON to string
         serializeJson(doc, json_response);
         sendResponse(json_response);
     } else {

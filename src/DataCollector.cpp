@@ -12,7 +12,7 @@ DataCollector::DataCollector() :
     lora_module = new LoRa915();
     radio433_module = new Radio433();
     barometer = new Barometer();
-    current_sensor = new CurrentSensor();
+    current_sensor = new CurrentVoltageSensor();
     
     // Initialize system status
     memset(&system_status, 0, sizeof(system_status));
@@ -317,4 +317,98 @@ void DataCollector::printSystemInfo() {
     Serial.printf("Barometer: %s\n", system_status.barometer_online ? "Online" : "Offline");
     Serial.printf("Current Sensor: %s\n", system_status.current_sensor_online ? "Online" : "Offline");
     Serial.println("===========================");
+}
+
+// =========================
+// Binary packers
+// =========================
+
+size_t DataCollector::packLoRaData(uint8_t* out, size_t max_len) {
+    if (!lora_module->isOnline() || max_len < sizeof(WireLoRa_t)) return 0;
+    WireLoRa_t w{};
+    w.version = 1;
+    w.packet_count = lora_module->getPacketCount();
+    w.rssi_dbm = lora_module->getRSSI();
+    w.snr_db = lora_module->getSNR();
+    // include latest packet if available
+    LoRaPacket_t pkt;
+    if (lora_module->getLatestPacket(pkt)) {
+        uint8_t len = pkt.data_length > 64 ? 64 : pkt.data_length;
+        w.latest_len = len;
+        memcpy(w.latest_data, pkt.data, len);
+    } else {
+        w.latest_len = 0;
+    }
+    memcpy(out, &w, sizeof(WireLoRa_t));
+    return sizeof(WireLoRa_t);
+}
+
+size_t DataCollector::pack433Data(uint8_t* out, size_t max_len) {
+    if (!radio433_module->isOnline() || max_len < sizeof(Wire433_t)) return 0;
+    Wire433_t w{};
+    w.version = 1;
+    w.packet_count = radio433_module->getPacketCount();
+    w.rssi_dbm = radio433_module->getRSSI();
+    Radio433Packet_t pkt;
+    if (radio433_module->getLatestPacket(pkt)) {
+        uint8_t len = pkt.data_length > 64 ? 64 : pkt.data_length;
+        w.latest_len = len;
+        memcpy(w.latest_data, pkt.data, len);
+    } else {
+        w.latest_len = 0;
+    }
+    memcpy(out, &w, sizeof(Wire433_t));
+    return sizeof(Wire433_t);
+}
+
+size_t DataCollector::packBarometerData(uint8_t* out, size_t max_len) {
+    if (!barometer->isOnline() || max_len < sizeof(WireBarometer_t)) return 0;
+    WireBarometer_t w{};
+    w.version = 1;
+    BarometerData_t d;
+    if (!barometer->getLatestReading(d)) return 0;
+    w.timestamp_ms = d.timestamp;
+    w.pressure_hpa = d.pressure_hpa;
+    w.temperature_c = d.temperature_c;
+    w.altitude_m = d.altitude_m;
+    memcpy(out, &w, sizeof(WireBarometer_t));
+    return sizeof(WireBarometer_t);
+}
+
+size_t DataCollector::packCurrentData(uint8_t* out, size_t max_len) {
+    if (!current_sensor->isOnline() || max_len < sizeof(WireCurrent_t)) return 0;
+    WireCurrent_t w{};
+    w.version = 1;
+    CurrentData_t d;
+    if (!current_sensor->getLatestReading(d)) return 0;
+    w.timestamp_ms = d.timestamp;
+    w.current_a = d.current_a;
+    w.voltage_v = d.voltage_v;
+    w.power_w = d.power_w;
+    w.raw_adc = current_sensor->getRawADC();
+    memcpy(out, &w, sizeof(WireCurrent_t));
+    return sizeof(WireCurrent_t);
+}
+
+size_t DataCollector::packStatus(uint8_t* out, size_t max_len) {
+    if (max_len < sizeof(WireStatus_t)) return 0;
+    updateSystemStatus();
+    WireStatus_t w{};
+    w.version = 1;
+    w.uptime_seconds = system_status.uptime_seconds;
+    w.system_state = (uint8_t)system_status.system_state;
+    uint8_t flags = 0;
+    if (system_status.lora_online) flags |= 1 << 0;
+    if (system_status.radio433_online) flags |= 1 << 1;
+    if (system_status.barometer_online) flags |= 1 << 2;
+    if (system_status.current_sensor_online) flags |= 1 << 3;
+    if (system_status.pi_connected) flags |= 1 << 4;
+    w.flags = flags;
+    w.packet_count_lora = system_status.packet_count_lora;
+    w.packet_count_433 = system_status.packet_count_433;
+    w.wakeup_time = system_status.wakeup_time;
+    w.free_heap = ESP.getFreeHeap();
+    w.chip_revision = ESP.getChipRevision();
+    memcpy(out, &w, sizeof(WireStatus_t));
+    return sizeof(WireStatus_t);
 }

@@ -15,26 +15,22 @@ Barometer::~Barometer() {
 bool Barometer::begin() {
     // Initialize I2C
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-    
-    // Try to initialize BME280 - try default address first, then alternate
-    if (!bme.begin(0x77, &Wire)) {  // Default BME280 address
-        if (!bme.begin(0x76, &Wire)) {  // Alternate BME280 address
-            Serial.println("Barometer: Could not find BME280 sensor");
-            return false;
-        }
+
+    // Initialize MS56xx (MS5611 lib supports MS5607)
+    ms.begin();
+    if (ms.reset() != MS5611_OK) {
+        Serial.println("Barometer: MS56xx reset failed");
+        return false;
     }
-    
-    // Set up oversampling and filtering
-    bme.setSampling(Adafruit_BME280::MODE_NORMAL,     // Operating mode
-                    Adafruit_BME280::SAMPLING_X2,     // Temperature oversampling
-                    Adafruit_BME280::SAMPLING_X16,    // Pressure oversampling
-                    Adafruit_BME280::SAMPLING_X1,     // Humidity oversampling
-                    Adafruit_BME280::FILTER_X16,      // Filtering
-                    Adafruit_BME280::STANDBY_MS_500); // Standby time
-    
+    // Read factory calibration PROM
+    if (ms.readPROM() != MS5611_OK) {
+        Serial.println("Barometer: MS56xx PROM read failed");
+        return false;
+    }
+
     is_initialized = true;
-    Serial.println("Barometer: BME280 initialized successfully");
-    
+    Serial.println("Barometer: MS56xx initialized successfully");
+
     // Take initial reading
     update();
     return true;
@@ -49,9 +45,23 @@ void Barometer::update() {
     
     if (xSemaphoreTake(data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         latest_reading.timestamp = millis();
-        latest_reading.pressure_hpa = bme.readPressure() / 100.0F; // Convert Pa to hPa
-        latest_reading.temperature_c = bme.readTemperature();
-        latest_reading.altitude_m = bme.readAltitude(sea_level_pressure_hpa);
+
+        // Perform D1 and D2 conversions with high OSR for better precision
+        ms.setOversampling(MS5611_OSR_4096);
+        if (ms.read() == MS5611_OK) {
+            double temperature = ms.getTemperature(); // °C
+            double pressure = ms.getPressure();       // mbar/hPa
+            latest_reading.temperature_c = (float)temperature;
+            latest_reading.pressure_hpa = (float)pressure;
+        } else {
+            // Keep previous values on read error
+        }
+
+        // Compute altitude from pressure
+        // Barometric formula approximation
+        // h = 44330 * (1 - (P/Pref)^(1/5.255))
+        float ratio = latest_reading.pressure_hpa / sea_level_pressure_hpa;
+        latest_reading.altitude_m = 44330.0f * (1.0f - powf(ratio, 0.19029495f));
         
         last_read_time = millis();
         
@@ -101,7 +111,8 @@ float Barometer::getAltitude() {
 }
 
 float Barometer::getHumidity() {
-    return is_initialized ? bme.readHumidity() : -1.0;
+    // MS5607 does not measure humidity
+    return -1.0f;
 }
 
 void Barometer::setSeaLevelPressure(float pressure_hpa) {

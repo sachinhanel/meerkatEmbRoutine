@@ -8,14 +8,14 @@
 #include "sensors/LoRa915.h"
 #include "sensors/Radio433.h"
 #include "sensors/Barometer.h"
-#include "sensors/CurrentSensor.h"
+#include "sensors/CurrentVoltageSensor.h"
 
 class DataCollector {
 private:
     LoRa915* lora_module;
     Radio433* radio433_module;
     Barometer* barometer;
-    CurrentSensor* current_sensor;
+    CurrentVoltageSensor* current_sensor;
     
     SystemStatus_t system_status;
     uint32_t boot_time;
@@ -51,12 +51,19 @@ public:
     bool getCurrentData(DynamicJsonDocument& doc);
     bool getAllData(DynamicJsonDocument& doc);
     bool getSystemStatus(DynamicJsonDocument& doc);
+
+    // Binary packers (return bytes written)
+    size_t packLoRaData(uint8_t* out, size_t max_len);
+    size_t pack433Data(uint8_t* out, size_t max_len);
+    size_t packBarometerData(uint8_t* out, size_t max_len);
+    size_t packCurrentData(uint8_t* out, size_t max_len);
+    size_t packStatus(uint8_t* out, size_t max_len);
     
     // Individual sensor access
     LoRa915* getLoRaModule() { return lora_module; }
     Radio433* getRadio433Module() { return radio433_module; }
     Barometer* getBarometerModule() { return barometer; }
-    CurrentSensor* getCurrentSensorModule() { return current_sensor; }
+    CurrentVoltageSensor* getCurrentSensorModule() { return current_sensor; }
     
     // Status
     const SystemStatus_t& getStatus() const { return system_status; }

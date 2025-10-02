@@ -4,13 +4,12 @@
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_BME280.h>
-#include <Adafruit_Sensor.h>
+#include <MS5611.h>
 #include "config.h"
 
 class Barometer {
 private:
-    Adafruit_BME280 bme;
+    MS5611 ms;
     BarometerData_t latest_reading;
     bool is_initialized;
     float sea_level_pressure_hpa;

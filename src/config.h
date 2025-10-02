@@ -149,4 +149,67 @@ typedef struct {
     float power_w;
 } CurrentData_t;
 
+// ===============================
+// Binary wire protocol structures
+// Keep frames under 255 bytes (1-byte LENGTH)
+// Little-endian, packed
+#if defined(__GNUC__)
+#define PACKED __attribute__((packed))
+#else
+#define PACKED
+#pragma pack(push, 1)
+#endif
+
+typedef struct PACKED {
+    uint8_t version;           // 1
+    uint16_t packet_count;     // 2
+    int16_t rssi_dbm;          // 2
+    float snr_db;              // 4
+    uint8_t latest_len;        // 1
+    uint8_t latest_data[64];   // 64
+} WireLoRa_t;                   // = 74 bytes
+
+typedef struct PACKED {
+    uint8_t version;           // 1
+    uint16_t packet_count;     // 2
+    int16_t rssi_dbm;          // 2
+    uint8_t latest_len;        // 1
+    uint8_t latest_data[64];   // 64
+} Wire433_t;                    // = 70 bytes
+
+typedef struct PACKED {
+    uint8_t version;           // 1
+    uint32_t timestamp_ms;     // 4
+    float pressure_hpa;        // 4
+    float temperature_c;       // 4
+    float altitude_m;          // 4
+} WireBarometer_t;              // = 17 bytes
+
+typedef struct PACKED {
+    uint8_t version;           // 1
+    uint32_t timestamp_ms;     // 4
+    float current_a;           // 4
+    float voltage_v;           // 4
+    float power_w;             // 4
+    int16_t raw_adc;           // 2
+} WireCurrent_t;                // = 19 bytes
+
+typedef struct PACKED {
+    uint8_t version;           // 1
+    uint32_t uptime_seconds;   // 4
+    uint8_t system_state;      // 1
+    uint8_t flags;             // 1 bitfield: b0 lora_online, b1 r433_online, b2 baro_online, b3 curr_online, b4 pi_connected
+    uint16_t packet_count_lora;// 2
+    uint16_t packet_count_433; // 2
+    uint32_t wakeup_time;      // 4
+    uint32_t free_heap;        // 4
+    uint8_t chip_revision;     // 1
+} WireStatus_t;                 // = 20 bytes
+
+#if !defined(__GNUC__)
+#pragma pack(pop)
+#endif
+
+#undef PACKED
+
 #endif // CONFIG_H
