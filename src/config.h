@@ -4,8 +4,8 @@
 // Pin Definitions for ESP32-S3
 // SPI Pins (shared between LoRa and 433MHz modules)
 #define SPI_SCK_PIN     11
-#define SPI_MISO_PIN    12
-#define SPI_MOSI_PIN    13
+#define SPI_MISO_PIN    13
+#define SPI_MOSI_PIN    12
 //_____
 
 // LoRa 915MHz Module specific Pins
