@@ -35,7 +35,13 @@
 //OTHER DEVICES TO BE ADDED
 //1. ERROR LED, POWER LED
 //2. AIM BOARD COMMUNICATION PINS TO BACKPLANE
-//3. SD CARD
+//3. SD CARD (doesnt need to be read from the pi but needs to make sure that there is adequate space to log data, throw erorr or delete old fils automatically if not enough space)
+
+
+//THINGS TO DO
+//NEED TO CHANGE THE 915 AND 433 TO SEND THROUGH BINARY RATHER THAN JSON, AS JSON IS TOO SLOW, PERHAPS CHANGE THE OTHER PERIPHELS OR KEEP THE SAME
+//CURRENT NEEDS VOLTAGE ALSO
+
 //
 
 
