@@ -21,11 +21,12 @@
 // Barometer Pins (I2C)
 #define I2C_SDA_PIN     9
 #define I2C_SCL_PIN     8
+#define MS5607_I2C_ADDRESS 0x77  // MS5607 I2C address (can also be 0x76)
 
 // Current Sensor Pin (Analog)
 #define CURRENT_SENSOR_PIN 10 // might be wrong
 
-// Raspberry Pi Communication  uses GPIO 19/20
+// Raspberry Pi Communication  uses GPIO 19/20 instead now, which is usb and doenst need to be set
 
 
 // #define PI_UART_TX      43

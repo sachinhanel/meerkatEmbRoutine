@@ -3,7 +3,6 @@
 #define DATA_COLLECTOR_H
 
 #include <Arduino.h>
-#include <ArduinoJson.h>
 #include "config.h"
 #include "sensors/LoRa915.h"
 #include "sensors/Radio433.h"
@@ -44,13 +43,7 @@ public:
     SystemState_t getSystemState() const { return system_status.system_state; }
     bool isOperational() const { return system_status.system_state == SYSTEM_OPERATIONAL; }
     
-    // Data access methods
-    bool getLoRaData(DynamicJsonDocument& doc);
-    bool get433Data(DynamicJsonDocument& doc);
-    bool getBarometerData(DynamicJsonDocument& doc);
-    bool getCurrentData(DynamicJsonDocument& doc);
-    bool getAllData(DynamicJsonDocument& doc);
-    bool getSystemStatus(DynamicJsonDocument& doc);
+    // (JSON accessors removed; binary packers below)
 
     // Binary packers (return bytes written)
     size_t packLoRaData(uint8_t* out, size_t max_len);

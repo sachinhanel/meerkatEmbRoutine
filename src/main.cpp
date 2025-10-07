@@ -1,12 +1,12 @@
 /*
  * ESP32 Rocketry Ground Station - Single File Version
  * Complete system in one file for embedded deployment
- * 
+ *
  * Hardware Requirements:
  * - ESP32 Dev Board
  * - 915MHz LoRa Module (SPI)
- * - 433MHz Radio Module (SPI) 
- * - BME280 Barometer (I2C)
+ * - 433MHz Radio Module (SPI)
+ * - MS5607 Barometer (I2C)
  * - Current Sensor (Analog)
  */
 
@@ -17,84 +17,14 @@
 #include <HardwareSerial.h>
 #include <LoRa.h>
 #include <RadioLib.h>
-#include <Adafruit_BME280.h>
-#include <Adafruit_Sensor.h>
-#include <ArduinoJson.h>
+#include <MS5611.h>
 
 //brings in config.h and its def also
 #include "DataCollector.h"
 #include "CommProtocol.h"
-// ====================================================================
-// CONFIGURATION AND CONSTANTS
-// ====================================================================
-
-// Pin Definitions
-#define SPI_SCK_PIN     18
-#define SPI_MISO_PIN    19
-#define SPI_MOSI_PIN    23
-
-// LoRa 915MHz Module Pins
-#define LORA_CS_PIN     5
-#define LORA_RST_PIN    14
-#define LORA_DIO0_PIN   2
-
-// 433MHz Radio Module Pins  
-#define RADIO433_CS_PIN 15
-#define RADIO433_RST_PIN 4
-#define RADIO433_DIO0_PIN 16
-
-// Barometer Pins (I2C)
-#define I2C_SDA_PIN     21
-#define I2C_SCL_PIN     22
-
-// Current Sensor Pin (Analog)
-#define CURRENT_SENSOR_PIN 36
-
-// Raspberry Pi Communication Pins (UART)
-#define PI_UART_TX      17
-#define PI_UART_RX      16
-#define PI_UART_BAUD    115200
-
-// Communication Protocol Constants
-#define HELLO_BYTE      0xAA
-#define GOODBYE_BYTE    0x55
-
-// Data Request Commands
-#define CMD_GET_LORA_DATA       0x01
-#define CMD_GET_433_DATA        0x02
-#define CMD_GET_BAROMETER_DATA  0x03
-#define CMD_GET_CURRENT_DATA    0x04
-#define CMD_GET_ALL_DATA        0x05
-#define CMD_GET_STATUS          0x06
-
-//i2c adresses for barometer
-#define BME280_ADDRESS_PRIMARY 0x76
-#define BME280_ADDRESS_ALTERNATE 0x77
-
-// Buffer Sizes
-#define LORA_BUFFER_SIZE        256
-#define RADIO433_BUFFER_SIZE    128
-#define MAX_PACKET_SIZE         64
-
-// Timing Constants (milliseconds)
-#define SENSOR_READ_INTERVAL    100
-#define RADIO_LISTEN_TIMEOUT    50
-#define PI_COMM_TIMEOUT         1000
-
-// LoRa Configuration
-#define LORA_FREQUENCY          915E6
-#define LORA_BANDWIDTH          125E3
-#define LORA_SPREADING_FACTOR   7
-#define LORA_CODING_RATE        5
-#define LORA_TX_POWER           17
-
-// 433MHz Radio Configuration
-#define RADIO433_FREQUENCY      433.0
-#define RADIO433_BITRATE        4.8
-#define RADIO433_FREQ_DEV       5.0
 
 // ====================================================================
-// DATA STRUCTURES
+// All pin definitions, constants, and data structures are in config.h
 // ====================================================================
 
 
@@ -108,7 +38,7 @@ CommProtocol commProtocol(&dataCollector, &Serial);
 
 // Sensor Hardware Objects
 SX1278 radio433Module(new Module(RADIO433_CS_PIN, RADIO433_DIO0_PIN, RADIO433_RST_PIN));
-Adafruit_BME280 bme280Sensor;
+MS5611 ms5607Sensor;
 HardwareSerial piSerial(2);
 
 // Data Buffers
@@ -183,14 +113,6 @@ void updateCurrentSensor();
 
 void addLoRaPacket(const LoRaPacket_t& packet);
 void addRadio433Packet(const Radio433Packet_t& packet);
-
-bool getLoRaDataJSON(DynamicJsonDocument& doc);
-bool getRadio433DataJSON(DynamicJsonDocument& doc);
-bool getBarometerDataJSON(DynamicJsonDocument& doc);
-bool getCurrentDataJSON(DynamicJsonDocument& doc);
-bool getAllDataJSON(DynamicJsonDocument& doc);
-bool getSystemStatusJSON(DynamicJsonDocument& doc);
-
 
 void handleSerialCommands();
 void printWelcomeMessage();
@@ -304,23 +226,25 @@ void initializeRadio433() {
 }
 
 void initializeBarometer() {
-    if (!bme280Sensor.begin(BME280_ADDRESS_ALTERNATE, &Wire)) {
-        if (!bme280Sensor.begin(BME280_ADDRESS_PRIMARY, &Wire)) {
-            Serial.println("Barometer: Could not find BME280 sensor");
-            barometerInitialized = false;
-            return;
-        }
+    // Initialize MS5607 (compatible with MS5611 library)
+    if (!ms5607Sensor.begin()) {
+        Serial.println("Barometer: MS5607 begin failed");
+        barometerInitialized = false;
+        return;
     }
-    
-    bme280Sensor.setSampling(Adafruit_BME280::MODE_NORMAL,
-                            Adafruit_BME280::SAMPLING_X2,
-                            Adafruit_BME280::SAMPLING_X16,
-                            Adafruit_BME280::SAMPLING_X1,
-                            Adafruit_BME280::FILTER_X16,
-                            Adafruit_BME280::STANDBY_MS_500);
-    
+
+    // Reset and read PROM
+    if (!ms5607Sensor.reset()) {
+        Serial.println("Barometer: MS5607 reset/PROM read failed");
+        barometerInitialized = false;
+        return;
+    }
+
+    // Set high oversampling for better precision
+    ms5607Sensor.setOversampling(OSR_ULTRA_HIGH);
+
     barometerInitialized = true;
-    Serial.println("Barometer: BME280 initialized successfully");
+    Serial.println("Barometer: MS5607 initialized successfully");
 }
 
 void initializeCurrentSensor() {
@@ -443,12 +367,24 @@ void checkRadio433Packets() {
 }
 
 void updateBarometer() {
+    if (!barometerInitialized) return;
+
     if (xSemaphoreTake(barometerDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         latestBarometerData.timestamp = millis();
-        latestBarometerData.pressure_hpa = bme280Sensor.readPressure() / 100.0F;
-        latestBarometerData.temperature_c = bme280Sensor.readTemperature();
-        latestBarometerData.altitude_m = bme280Sensor.readAltitude(1013.25);
-        
+
+        // Read temperature and pressure
+        int result = ms5607Sensor.read();
+        if (result == MS5611_READ_OK) {
+            latestBarometerData.temperature_c = (float)ms5607Sensor.getTemperature();
+            latestBarometerData.pressure_hpa = (float)ms5607Sensor.getPressure();
+
+            // Calculate altitude (using standard sea level pressure)
+            float ratio = latestBarometerData.pressure_hpa / 1013.25f;
+            latestBarometerData.altitude_m = 44330.0f * (1.0f - powf(ratio, 0.19029495f));
+        } else {
+            Serial.printf("Barometer: Read failed with code %d\n", result);
+        }
+
         xSemaphoreGive(barometerDataMutex);
     }
 }
@@ -517,185 +453,10 @@ void addRadio433Packet(const Radio433Packet_t& packet) {
 
 // ====================================================================
 // COMMUNICATION PROTOCOL
-// =================================================================++
-
-
-//Now handled in CommProtocol.cpp fully
-
-// ====================================================================
-// JSON DATA FUNCTIONS
 // ====================================================================
 
-bool getLoRaDataJSON(DynamicJsonDocument& doc) {
-    if (!loraInitialized) {
-        doc["error"] = "LoRa module offline";
-        return false;
-    }
-    
-    doc["module"] = "LoRa_915MHz";
-    doc["online"] = true;
-    doc["packet_count"] = loraPacketCount;
-    doc["rssi"] = LoRa.packetRssi();
-    doc["snr"] = LoRa.packetSnr();
-    doc["current_channel_rssi"] = LoRa.rssi();    // Optional: live channel RSSI
-    
-    if (xSemaphoreTake(loraBufferMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        JsonArray packetsArray = doc["packets"].to<JsonArray>();
-        uint16_t current = loraBufferTail;
-        int count = 0;
-        
-        while (current != loraBufferHead && count < 10) {
-            JsonObject packet = packetsArray.createNestedObject();
-            packet["timestamp"] = loraBuffer[current].timestamp;
-            packet["rssi"] = loraBuffer[current].rssi;
-            packet["snr"] = loraBuffer[current].snr;
-            packet["length"] = loraBuffer[current].data_length;
-            
-            String hexData = "";
-            for (int i = 0; i < loraBuffer[current].data_length; i++) {
-                if (loraBuffer[current].data[i] < 16) hexData += "0";
-                hexData += String(loraBuffer[current].data[i], HEX);
-            }
-            packet["data"] = hexData;
-            
-            current = (current + 1) % LORA_BUFFER_SIZE;
-            count++;
-        }
-        
-        loraBufferTail = loraBufferHead; // Clear buffer
-        xSemaphoreGive(loraBufferMutex);
-    }
-    
-    return true;
-}
-
-bool getRadio433DataJSON(DynamicJsonDocument& doc) {
-    if (!radio433Initialized) {
-        doc["error"] = "433MHz module offline";
-        return false;
-    }
-    
-    doc["module"] = "Radio_433MHz";
-    doc["online"] = true;
-    doc["packet_count"] = radio433PacketCount;
-    doc["rssi"] = radio433Module.getRSSI();
-    
-    if (xSemaphoreTake(radio433BufferMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        JsonArray packetsArray = doc["packets"].to<JsonArray>();
-        uint16_t current = radio433BufferTail;
-        int count = 0;
-        
-        while (current != radio433BufferHead && count < 10) {
-            JsonObject packet = packetsArray.createNestedObject();
-            packet["timestamp"] = radio433Buffer[current].timestamp;
-            packet["rssi"] = radio433Buffer[current].rssi;
-            packet["length"] = radio433Buffer[current].data_length;
-            
-            String hexData = "";
-            for (int i = 0; i < radio433Buffer[current].data_length; i++) {
-                if (radio433Buffer[current].data[i] < 16) hexData += "0";
-                hexData += String(radio433Buffer[current].data[i], HEX);
-            }
-            packet["data"] = hexData;
-            
-            current = (current + 1) % RADIO433_BUFFER_SIZE;
-            count++;
-        }
-        
-        radio433BufferTail = radio433BufferHead; // Clear buffer
-        xSemaphoreGive(radio433BufferMutex);
-    }
-    
-    return true;
-}
-
-bool getBarometerDataJSON(DynamicJsonDocument& doc) {
-    if (!barometerInitialized) {
-        doc["error"] = "Barometer offline";
-        return false;
-    }
-    
-    if (xSemaphoreTake(barometerDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        doc["module"] = "Barometer";
-        doc["online"] = true;
-        doc["timestamp"] = latestBarometerData.timestamp;
-        doc["pressure_hpa"] = latestBarometerData.pressure_hpa;
-        doc["temperature_c"] = latestBarometerData.temperature_c;
-        doc["altitude_m"] = latestBarometerData.altitude_m;
-        doc["humidity_percent"] = bme280Sensor.readHumidity();
-        
-        xSemaphoreGive(barometerDataMutex);
-        return true;
-    }
-    
-    doc["error"] = "Failed to read barometer data";
-    return false;
-}
-
-bool getCurrentDataJSON(DynamicJsonDocument& doc) {
-    if (!currentSensorInitialized) {
-        doc["error"] = "Current sensor offline";
-        return false;
-    }
-    
-    if (xSemaphoreTake(currentDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        doc["module"] = "CurrentSensor";
-        doc["online"] = true;
-        doc["timestamp"] = latestCurrentData.timestamp;
-        doc["current_a"] = latestCurrentData.current_a;
-        doc["voltage_v"] = latestCurrentData.voltage_v;
-        doc["power_w"] = latestCurrentData.power_w;
-        doc["raw_adc"] = analogRead(CURRENT_SENSOR_PIN);
-        
-        xSemaphoreGive(currentDataMutex);
-        return true;
-    }
-    
-    doc["error"] = "Failed to read current sensor data";
-    return false;
-}
-
-bool getAllDataJSON(DynamicJsonDocument& doc) {
-    doc["timestamp"] = millis();
-    
-    DynamicJsonDocument loraDoc(2048);
-    getLoRaDataJSON(loraDoc);
-    doc["lora"] = loraDoc.as<JsonObject>();
-    
-    DynamicJsonDocument radio433Doc(2048);
-    getRadio433DataJSON(radio433Doc);
-    doc["radio433"] = radio433Doc.as<JsonObject>();
-    
-    DynamicJsonDocument baroDoc(2048);
-    getBarometerDataJSON(baroDoc);
-    doc["barometer"] = baroDoc.as<JsonObject>();
-    
-    DynamicJsonDocument currentDoc(2048);
-    getCurrentDataJSON(currentDoc);
-    doc["current"] = currentDoc.as<JsonObject>();
-    
-    DynamicJsonDocument statusDoc(2048);
-    getSystemStatusJSON(statusDoc);
-    doc["status"] = statusDoc.as<JsonObject>();
-    
-    return true;
-}
-
-bool getSystemStatusJSON(DynamicJsonDocument& doc) {
-    updateSystemStatus();
-    
-    doc["uptime_seconds"] = systemStatus.uptime_seconds;
-    doc["lora_online"] = systemStatus.lora_online;
-    doc["radio433_online"] = systemStatus.radio433_online;
-    doc["barometer_online"] = systemStatus.barometer_online;
-    doc["current_sensor_online"] = systemStatus.current_sensor_online;
-    doc["packet_count_lora"] = systemStatus.packet_count_lora;
-    doc["packet_count_433"] = systemStatus.packet_count_433;
-    doc["free_heap"] = ESP.getFreeHeap();
-    doc["chip_revision"] = ESP.getChipRevision();
-    
-    return true;
-}
+// All communication protocol handling is now in CommProtocol.cpp
+// Binary data transmission only - no JSON
 
 // ====================================================================
 // UTILITY FUNCTIONS

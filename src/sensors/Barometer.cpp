@@ -1,4 +1,5 @@
 #include "Barometer.h"
+// #include "MS5611.h"
 
 Barometer::Barometer() : is_initialized(false), sea_level_pressure_hpa(1013.25), last_read_time(0) {
     data_mutex = xSemaphoreCreateMutex();
@@ -17,14 +18,14 @@ bool Barometer::begin() {
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 
     // Initialize MS56xx (MS5611 lib supports MS5607)
-    ms.begin();
-    if (ms.reset() != MS5611_OK) {
-        Serial.println("Barometer: MS56xx reset failed");
+    if (!ms.begin()) {
+        Serial.println("Barometer: MS56xx begin failed");
         return false;
     }
-    // Read factory calibration PROM
-    if (ms.readPROM() != MS5611_OK) {
-        Serial.println("Barometer: MS56xx PROM read failed");
+    
+    // reset() returns bool and internally reads PROM
+    if (!ms.reset()) {
+        Serial.println("Barometer: MS56xx reset/PROM read failed");
         return false;
     }
 
@@ -47,19 +48,19 @@ void Barometer::update() {
         latest_reading.timestamp = millis();
 
         // Perform D1 and D2 conversions with high OSR for better precision
-        ms.setOversampling(MS5611_OSR_4096);
-        if (ms.read() == MS5611_OK) {
+        ms.setOversampling(OSR_ULTRA_HIGH);  // or OSR_HIGH
+        int result = ms.read();
+        if (result == MS5611_READ_OK) {  // Note: no MS5611:: prefix
             double temperature = ms.getTemperature(); // °C
             double pressure = ms.getPressure();       // mbar/hPa
             latest_reading.temperature_c = (float)temperature;
             latest_reading.pressure_hpa = (float)pressure;
         } else {
             // Keep previous values on read error
+            Serial.printf("Barometer: Read failed with code %d\n", result);
         }
 
         // Compute altitude from pressure
-        // Barometric formula approximation
-        // h = 44330 * (1 - (P/Pref)^(1/5.255))
         float ratio = latest_reading.pressure_hpa / sea_level_pressure_hpa;
         latest_reading.altitude_m = 44330.0f * (1.0f - powf(ratio, 0.19029495f));
         
@@ -73,7 +74,6 @@ void Barometer::update() {
                       latest_reading.altitude_m);
     }
 }
-
 bool Barometer::getLatestReading(BarometerData_t& data) {
     if (xSemaphoreTake(data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         data = latest_reading;

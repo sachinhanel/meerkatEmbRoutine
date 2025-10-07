@@ -4,7 +4,6 @@
 
 #include <Arduino.h>
 #include <HardwareSerial.h>
-#include <ArduinoJson.h>
 #include "../include/config.h"
 #include "DataCollector.h"
 

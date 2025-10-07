@@ -1,5 +1,5 @@
 #include "CommProtocol.h"
-#include <ArduinoJson.h>
+
 
 CommProtocol::CommProtocol(DataCollector* collector, Stream* serial) : 
     data_collector(collector),
@@ -131,8 +131,6 @@ void CommProtocol::processMessage(uint8_t peripheral_id, const uint8_t* message_
 }
 
 void CommProtocol::processSystemCommand(uint8_t command) {
-    DynamicJsonDocument doc(1024);
-    String json_response;
     bool success = false;
     
     switch (command) {
@@ -258,10 +256,7 @@ void CommProtocol::processSystemCommand(uint8_t command) {
             return;
     }
 
-    if (success) {
-        serializeJson(doc, json_response);
-        sendResponse(json_response);
-    } else {
+    if (!success) {
         sendErrorResponse("Failed to process command");
     }
 }
@@ -294,13 +289,21 @@ void CommProtocol::sendResponse(const String& response) {
 }
 
 void CommProtocol::sendErrorResponse(const String& error_message) {
-    DynamicJsonDocument error_doc(1024);
-    error_doc["error"] = error_message;
-    error_doc["timestamp"] = millis();
-    
-    String error_response;
-    serializeJson(error_doc, error_response);
-    sendResponse(error_response);
+    // Minimal binary error: version(1)=1, code(1)=1, len(1)=min(50), ascii message bytes (truncated)
+    uint8_t buf[64];
+    size_t msg_len = error_message.length();
+    if (msg_len > 60) msg_len = 60;
+    buf[0] = 1; // version
+    buf[1] = 1; // code: generic error
+    buf[2] = (uint8_t)msg_len;
+    memcpy(&buf[3], error_message.c_str(), msg_len);
+    current_state = SENDING_RESPONSE;
+    serial_port->write((uint8_t)HELLO_BYTE);
+    serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
+    serial_port->write((uint8_t)(3 + msg_len));
+    serial_port->write(buf, 3 + msg_len);
+    serial_port->write((uint8_t)GOODBYE_BYTE);
+    serial_port->flush();
 }
 
 void CommProtocol::resetState() {
@@ -318,18 +321,18 @@ bool CommProtocol::isConnected() const {
     return (millis() - last_activity_time < 30000);
 }
 
-void CommProtocol::sendTestMessage() {
-    DynamicJsonDocument test_doc(1024);
-    test_doc["message"] = "ESP32 Ground Station Test";
-    test_doc["timestamp"] = millis();
-    test_doc["uptime"] = millis() / 1000;
+// void CommProtocol::sendTestMessage() {
+//     DynamicJsonDocument test_doc(1024);
+//     test_doc["message"] = "ESP32 Ground Station Test";
+//     test_doc["timestamp"] = millis();
+//     test_doc["uptime"] = millis() / 1000;
     
-    String test_response;
-    serializeJson(test_doc, test_response);
-    sendResponse(test_response);
+//     String test_response;
+//     serializeJson(test_doc, test_response);
+//     sendResponse(test_response);
     
-    Serial.println("CommProtocol: Test message sent");
-}
+//     Serial.println("CommProtocol: Test message sent");
+// }
 
 void CommProtocol::printStats() {
     Serial.println("=== Communication Protocol Stats ===");
