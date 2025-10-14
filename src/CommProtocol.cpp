@@ -1,8 +1,9 @@
 #include "CommProtocol.h"
 
 
-CommProtocol::CommProtocol(DataCollector* collector, Stream* serial) : 
+CommProtocol::CommProtocol(DataCollector* collector, Stream* serial) :
     data_collector(collector),
+    serial_port(serial),
     current_state(WAIT_FOR_HELLO),
     received_peripheral_id(0),
     expected_message_length(0),
@@ -10,13 +11,12 @@ CommProtocol::CommProtocol(DataCollector* collector, Stream* serial) :
     last_activity_time(0),
     hello_received_time(0),
     response_index(0) {
-    
-    //serial_port = &Serial; // Use Serial2 for Pi communication
+
     memset(message_buffer, 0, sizeof(message_buffer));
 }
 
 CommProtocol::~CommProtocol() {
-    end();
+    end(); 
 }
 
 bool CommProtocol::begin() {
@@ -51,9 +51,9 @@ void CommProtocol::process() {
                 if (received_byte == HELLO_BYTE) {
                     current_state = WAIT_FOR_PERIPHERAL_ID;
                     hello_received_time = millis();
-                    Serial.println("CommProtocol: HELLO received");
+                    Serial.println("\n>>> CommProtocol: HELLO received (0x7E)");
                 } else {
-                    Serial.printf("CommProtocol: Expected HELLO (0x%02X), got 0x%02X\n", 
+                    Serial.printf(">>> CommProtocol: Expected HELLO (0x%02X), got 0x%02X\n",
                                   HELLO_BYTE, received_byte);
                 }
                 break;
@@ -61,25 +61,29 @@ void CommProtocol::process() {
             case WAIT_FOR_PERIPHERAL_ID:
                 received_peripheral_id = received_byte;
                 current_state = WAIT_FOR_LENGTH;
-                Serial.printf("CommProtocol: Peripheral ID received: 0x%02X\n", received_peripheral_id);
+                Serial.printf(">>> Peripheral ID: 0x%02X\n", received_peripheral_id);
                 break;
-                
+
             case WAIT_FOR_LENGTH:
                 expected_message_length = received_byte;
                 received_message_length = 0;
                 current_state = (expected_message_length > 0) ? WAIT_FOR_MESSAGE_DATA : WAIT_FOR_GOODBYE;
-                Serial.printf("CommProtocol: Message length: %d bytes\n", expected_message_length);
+                Serial.printf(">>> Message Length: %d bytes\n", expected_message_length);
                 break;
-                
+
             case WAIT_FOR_MESSAGE_DATA:
-                if (received_message_length < expected_message_length && 
+                if (received_message_length < expected_message_length &&
                     received_message_length < sizeof(message_buffer)) {
                     message_buffer[received_message_length] = received_byte;
                     received_message_length++;
-                    
+
                     if (received_message_length >= expected_message_length) {
                         current_state = WAIT_FOR_GOODBYE;
-                        Serial.printf("CommProtocol: Message data received (%d bytes)\n", received_message_length);
+                        Serial.printf(">>> Message Data: ");
+                        for (uint8_t i = 0; i < received_message_length; i++) {
+                            Serial.printf("%02X ", message_buffer[i]);
+                        }
+                        Serial.println();
                     }
                 } else {
                     Serial.println("CommProtocol: Message buffer overflow");
@@ -87,13 +91,13 @@ void CommProtocol::process() {
                     resetState();
                 }
                 break;
-                
+
             case WAIT_FOR_GOODBYE:
                 if (received_byte == GOODBYE_BYTE) {
-                    Serial.println("CommProtocol: GOODBYE received - processing message");
+                    Serial.println(">>> GOODBYE received (0x7F) - Processing command...");
                     processMessage(received_peripheral_id, message_buffer, received_message_length);
                 } else {
-                    Serial.printf("CommProtocol: Expected GOODBYE (0x%02X), got 0x%02X\n", 
+                    Serial.printf(">>> Expected GOODBYE (0x%02X), got 0x%02X\n",
                                   GOODBYE_BYTE, received_byte);
                     sendErrorResponse("Invalid packet format");
                 }
@@ -333,6 +337,21 @@ bool CommProtocol::isConnected() const {
     
 //     Serial.println("CommProtocol: Test message sent");
 // }
+
+void CommProtocol::sendStatusUpdate() {
+    // Send an unsolicited status update (useful for heartbeat/testing)
+    uint8_t buf[64];
+    size_t n = data_collector->packStatus(buf, sizeof(buf));
+    if (n > 0) {
+        serial_port->write((uint8_t)HELLO_BYTE);
+        serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
+        serial_port->write((uint8_t)n);
+        serial_port->write(buf, n);
+        serial_port->write((uint8_t)GOODBYE_BYTE);
+        serial_port->flush();
+        Serial.printf("CommProtocol: Sent unsolicited status update (%d bytes)\n", (int)n);
+    }
+}
 
 void CommProtocol::printStats() {
     Serial.println("=== Communication Protocol Stats ===");

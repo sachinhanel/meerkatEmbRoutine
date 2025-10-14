@@ -27,11 +27,14 @@
 #define CURRENT_SENSOR_PIN 10 // might be wrong
 
 // Raspberry Pi Communication  uses GPIO 19/20 instead now, which is usb and doenst need to be set
-
-
 // #define PI_UART_TX      43
 // #define PI_UART_RX      44
 // #define PI_UART_BAUD    115200
+
+// WiFi Configuration (for remote monitoring in TEST_MODE)
+#define WIFI_SSID       "Telstra1842A7_EXT"
+#define WIFI_PASSWORD   "hpr9a26puk"
+#define TELNET_PORT     23
 
 //OTHER DEVICES TO BE ADDED
 //1. ERROR LED, POWER LED

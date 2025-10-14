@@ -1,62 +1,83 @@
 #include "DataCollector.h"
 
-DataCollector::DataCollector() : 
+DataCollector::DataCollector() :
     boot_time(0),
     last_lora_check(0),
     last_radio433_check(0),
     last_barometer_update(0),
     last_current_update(0),
     last_status_update(0) {
-    
+
+#ifdef TEST_MODE
+    // Test mode - don't initialize sensor objects (no hardware)
+    Serial.println("DataCollector: TEST_MODE enabled - skipping sensor initialization");
+#else
     // Initialize sensor objects
     lora_module = new LoRa915();
     radio433_module = new Radio433();
     barometer = new Barometer();
     current_sensor = new CurrentVoltageSensor();
-    
+#endif
+
     // Initialize system status
     memset(&system_status, 0, sizeof(system_status));
-    system_status.system_state = SYSTEM_WAITING_FOR_WAKEUP;  // Start in sleep mode
+    system_status.system_state = SYSTEM_OPERATIONAL;  // Start operational in test mode
     boot_time = millis();
 }
 
 DataCollector::~DataCollector() {
     end();
+#ifndef TEST_MODE
     delete lora_module;
     delete radio433_module;
     delete barometer;
     delete current_sensor;
+#endif
 }
 
 bool DataCollector::begin() {
+#ifdef TEST_MODE
+    Serial.println("DataCollector: TEST_MODE - Simulating all sensors online");
+    system_status.lora_online = true;
+    system_status.radio433_online = true;
+    system_status.barometer_online = true;
+    system_status.current_sensor_online = true;
+    system_status.system_state = SYSTEM_OPERATIONAL;
+
+    Serial.println("DataCollector: All fake sensors ready for testing!");
+    return true;
+#else
     Serial.println("DataCollector: Initializing all sensors...");
-    
+
     // Initialize each sensor
     system_status.lora_online = lora_module->begin();
     system_status.radio433_online = radio433_module->begin();
     system_status.barometer_online = barometer->begin();
     system_status.current_sensor_online = current_sensor->begin();
-    
+
     // Update system status
     updateSystemStatus();
-    
+
     Serial.printf("DataCollector: Initialization complete. Status: LoRa:%s, 433MHz:%s, Barometer:%s, Current:%s\n",
                   system_status.lora_online ? "OK" : "FAIL",
                   system_status.radio433_online ? "OK" : "FAIL",
                   system_status.barometer_online ? "OK" : "FAIL",
                   system_status.current_sensor_online ? "OK" : "FAIL");
-    
+
     Serial.println("DataCollector: System waiting for WAKEUP command from Raspberry Pi");
-    
-    return (system_status.lora_online || system_status.radio433_online || 
+
+    return (system_status.lora_online || system_status.radio433_online ||
             system_status.barometer_online || system_status.current_sensor_online);
+#endif
 }
 
 void DataCollector::end() {
+#ifndef TEST_MODE
     if (lora_module) lora_module->end();
     if (radio433_module) radio433_module->end();
     if (barometer) barometer->end();
     if (current_sensor) current_sensor->end();
+#endif
 }
 
 void DataCollector::setSystemState(SystemState_t new_state) {
@@ -72,64 +93,78 @@ void DataCollector::setSystemState(SystemState_t new_state) {
 }
 
 void DataCollector::pollRadios() {
+#ifndef TEST_MODE
     uint32_t current_time = millis();
-    
+
     // Always check LoRa for incoming packets (even when sleeping)
-    if (lora_module->isOnline() && 
+    if (lora_module->isOnline() &&
         (current_time - last_lora_check > RADIO_LISTEN_TIMEOUT)) {
         lora_module->checkForPackets();
         last_lora_check = current_time;
     }
-    
+
     // Only check 433MHz when system is operational
     if (system_status.system_state == SYSTEM_OPERATIONAL &&
-        radio433_module->isOnline() && 
+        radio433_module->isOnline() &&
         (current_time - last_radio433_check > RADIO_LISTEN_TIMEOUT)) {
         radio433_module->checkForPackets();
         last_radio433_check = current_time;
     }
+#endif
 }
 
 void DataCollector::pollSensors() {
+#ifndef TEST_MODE
     // Only update sensors when system is operational
     if (system_status.system_state != SYSTEM_OPERATIONAL) {
         return;
     }
-    
+
     uint32_t current_time = millis();
-    
+
     // Update barometer
-    if (barometer->isOnline() && 
+    if (barometer->isOnline() &&
         (current_time - last_barometer_update > SENSOR_READ_INTERVAL)) {
         barometer->update();
         last_barometer_update = current_time;
     }
-    
+
     // Update current sensor
-    if (current_sensor->isOnline() && 
+    if (current_sensor->isOnline() &&
         (current_time - last_current_update > SENSOR_READ_INTERVAL)) {
         current_sensor->update();
         last_current_update = current_time;
     }
-    
+
     // Update system status periodically
-    if (current_time - last_status_update > 5000) // Every 5 seconds
+    if (current_time - last_status_update > 5000) { // Every 5 seconds
         updateSystemStatus();
         last_status_update = current_time;
     }
+#endif
+}
 
-    
+
 
 void DataCollector::updateSystemStatus() {
     system_status.uptime_seconds = (millis() - boot_time) / 1000;
+
+#ifndef TEST_MODE
     system_status.packet_count_lora = lora_module->getPacketCount();
     system_status.packet_count_433 = radio433_module->getPacketCount();
-    
+
     // Re-check sensor status
     system_status.lora_online = lora_module->isOnline();
     system_status.radio433_online = radio433_module->isOnline();
     system_status.barometer_online = barometer->isOnline();
     system_status.current_sensor_online = current_sensor->isOnline();
+#else
+    // In test mode, keep counters for fake data
+    static uint16_t test_lora_count = 0;
+    static uint16_t test_433_count = 0;
+    system_status.packet_count_lora = test_lora_count++;
+    system_status.packet_count_433 = test_433_count++;
+#endif
 }
 
 
@@ -160,7 +195,23 @@ void DataCollector::printSystemInfo() {
 // =========================
 
 size_t DataCollector::packLoRaData(uint8_t* out, size_t max_len) {
-    if (!lora_module->isOnline() || max_len < sizeof(WireLoRa_t)) return 0;
+    if (max_len < sizeof(WireLoRa_t)) return 0;
+
+#ifdef TEST_MODE
+    // Generate fake LoRa data
+    WireLoRa_t w{};
+    w.version = 1;
+    static uint16_t test_packet_count = 0;
+    w.packet_count = test_packet_count++;
+    w.rssi_dbm = -85;
+    w.snr_db = 3.5;
+    const char* test_data = "TestLoRaPacket";
+    w.latest_len = strlen(test_data);
+    memcpy(w.latest_data, test_data, w.latest_len);
+    memcpy(out, &w, sizeof(WireLoRa_t));
+    return sizeof(WireLoRa_t);
+#else
+    if (!lora_module->isOnline()) return 0;
     WireLoRa_t w{};
     w.version = 1;
     w.packet_count = lora_module->getPacketCount();
@@ -177,10 +228,26 @@ size_t DataCollector::packLoRaData(uint8_t* out, size_t max_len) {
     }
     memcpy(out, &w, sizeof(WireLoRa_t));
     return sizeof(WireLoRa_t);
+#endif
 }
 
 size_t DataCollector::pack433Data(uint8_t* out, size_t max_len) {
-    if (!radio433_module->isOnline() || max_len < sizeof(Wire433_t)) return 0;
+    if (max_len < sizeof(Wire433_t)) return 0;
+
+#ifdef TEST_MODE
+    // Generate fake 433MHz data
+    Wire433_t w{};
+    w.version = 1;
+    static uint16_t test_packet_count = 0;
+    w.packet_count = test_packet_count++;
+    w.rssi_dbm = -92;
+    const char* test_data = "Test433Packet";
+    w.latest_len = strlen(test_data);
+    memcpy(w.latest_data, test_data, w.latest_len);
+    memcpy(out, &w, sizeof(Wire433_t));
+    return sizeof(Wire433_t);
+#else
+    if (!radio433_module->isOnline()) return 0;
     Wire433_t w{};
     w.version = 1;
     w.packet_count = radio433_module->getPacketCount();
@@ -195,10 +262,24 @@ size_t DataCollector::pack433Data(uint8_t* out, size_t max_len) {
     }
     memcpy(out, &w, sizeof(Wire433_t));
     return sizeof(Wire433_t);
+#endif
 }
 
 size_t DataCollector::packBarometerData(uint8_t* out, size_t max_len) {
-    if (!barometer->isOnline() || max_len < sizeof(WireBarometer_t)) return 0;
+    if (max_len < sizeof(WireBarometer_t)) return 0;
+
+#ifdef TEST_MODE
+    // Generate fake barometer data
+    WireBarometer_t w{};
+    w.version = 1;
+    w.timestamp_ms = millis();
+    w.pressure_hpa = 1013.25;
+    w.temperature_c = 22.5;
+    w.altitude_m = 123.4;
+    memcpy(out, &w, sizeof(WireBarometer_t));
+    return sizeof(WireBarometer_t);
+#else
+    if (!barometer->isOnline()) return 0;
     WireBarometer_t w{};
     w.version = 1;
     BarometerData_t d;
@@ -209,10 +290,25 @@ size_t DataCollector::packBarometerData(uint8_t* out, size_t max_len) {
     w.altitude_m = d.altitude_m;
     memcpy(out, &w, sizeof(WireBarometer_t));
     return sizeof(WireBarometer_t);
+#endif
 }
 
 size_t DataCollector::packCurrentData(uint8_t* out, size_t max_len) {
-    if (!current_sensor->isOnline() || max_len < sizeof(WireCurrent_t)) return 0;
+    if (max_len < sizeof(WireCurrent_t)) return 0;
+
+#ifdef TEST_MODE
+    // Generate fake current sensor data
+    WireCurrent_t w{};
+    w.version = 1;
+    w.timestamp_ms = millis();
+    w.current_a = 0.5;
+    w.voltage_v = 12.3;
+    w.power_w = 6.15;
+    w.raw_adc = 2048;
+    memcpy(out, &w, sizeof(WireCurrent_t));
+    return sizeof(WireCurrent_t);
+#else
+    if (!current_sensor->isOnline()) return 0;
     WireCurrent_t w{};
     w.version = 1;
     CurrentData_t d;
@@ -224,6 +320,7 @@ size_t DataCollector::packCurrentData(uint8_t* out, size_t max_len) {
     w.raw_adc = current_sensor->getRawADC();
     memcpy(out, &w, sizeof(WireCurrent_t));
     return sizeof(WireCurrent_t);
+#endif
 }
 
 size_t DataCollector::packStatus(uint8_t* out, size_t max_len) {

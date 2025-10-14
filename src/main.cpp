@@ -11,13 +11,17 @@
  */
 
 #include <Arduino.h>
+#include <WiFi.h>
+
+#ifndef TEST_MODE
+// Only include hardware libraries when not in test mode
 #include <SPI.h>
 #include <Wire.h>
-#include <WiFi.h>
 #include <HardwareSerial.h>
 #include <LoRa.h>
 #include <RadioLib.h>
 #include <MS5611.h>
+#endif
 
 //brings in config.h and its def also
 #include "DataCollector.h"
@@ -34,12 +38,20 @@
 
 
 DataCollector dataCollector;
-CommProtocol commProtocol(&dataCollector, &Serial);  
+CommProtocol commProtocol(&dataCollector, &Serial);
 
-// Sensor Hardware Objects
+#ifdef TEST_MODE
+// WiFi Telnet Server for remote serial monitoring
+WiFiServer telnetServer(TELNET_PORT);
+WiFiClient telnetClient;
+#endif
+
+#ifndef TEST_MODE
+// Sensor Hardware Objects (only in normal mode)
 SX1278 radio433Module(new Module(RADIO433_CS_PIN, RADIO433_DIO0_PIN, RADIO433_RST_PIN));
 MS5611 ms5607Sensor;
 HardwareSerial piSerial(2);
+#endif
 
 // Data Buffers
 LoRaPacket_t loraBuffer[LORA_BUFFER_SIZE];
@@ -119,6 +131,44 @@ void printWelcomeMessage();
 void printSystemStatus();
 void updateSystemStatus();
 
+#ifdef TEST_MODE
+// WiFi Telnet handling
+void handleTelnetClients() {
+    // Check for new clients
+    if (telnetServer.hasClient()) {
+        // Disconnect old client if exists
+        if (telnetClient && telnetClient.connected()) {
+            telnetClient.stop();
+        }
+        telnetClient = telnetServer.available();
+        Serial.println("\n[WiFi] Telnet client connected!");
+        telnetClient.println("=== ESP32 Remote Serial Monitor ===");
+        telnetClient.printf("Connected to: %s\n", WiFi.localIP().toString().c_str());
+        telnetClient.println("===================================\n");
+    }
+}
+
+// Override Serial.print functions to also send to telnet
+class TelnetSerial : public Print {
+public:
+    size_t write(uint8_t c) override {
+        size_t n = Serial.write(c);
+        if (telnetClient && telnetClient.connected()) {
+            telnetClient.write(c);
+        }
+        return n;
+    }
+
+    size_t write(const uint8_t *buffer, size_t size) override {
+        size_t n = Serial.write(buffer, size);
+        if (telnetClient && telnetClient.connected()) {
+            telnetClient.write(buffer, size);
+        }
+        return n;
+    }
+};
+#endif
+
 // ====================================================================
 // SETUP FUNCTION
 // ====================================================================
@@ -127,35 +177,71 @@ void setup() {
     // Initialize serial communication
     setupSerial();
     printWelcomeMessage();
-    
-    // Initialize communication buses
+
+#ifdef TEST_MODE
+    // TEST MODE: Initialize WiFi for remote monitoring
+    Serial.println("\nConnecting to WiFi...");
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    int wifi_timeout = 0;
+    while (WiFi.status() != WL_CONNECTED && wifi_timeout < 20) {
+        delay(500);
+        Serial.print(".");
+        wifi_timeout++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi Connected!");
+        Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+        Serial.printf("Telnet server on port %d\n", TELNET_PORT);
+        Serial.println("Connect with: telnet <ip> 23");
+        telnetServer.begin();
+        telnetServer.setNoDelay(true);
+    } else {
+        Serial.println("\nWiFi connection failed - continuing without remote monitoring");
+    }
+
+    // TEST MODE: Initialize DataCollector with fake sensors
+    dataCollector.begin();
+#else
+    // NORMAL MODE: Initialize communication buses
     setupSPI();
     setupI2C();
-    
+
     // Create mutexes for thread safety
     loraBufferMutex = xSemaphoreCreateMutex();
     radio433BufferMutex = xSemaphoreCreateMutex();
     barometerDataMutex = xSemaphoreCreateMutex();
     currentDataMutex = xSemaphoreCreateMutex();
-    
+
     // Initialize all sensors
     initializeLoRa();
     initializeRadio433();
     initializeBarometer();
     initializeCurrentSensor();
-    
-    
+
+    // Initialize DataCollector with real sensors
+    dataCollector.begin();
+#endif
+
     // Initialize system status
     bootTime = millis();
     updateSystemStatus();
-    
+
+    printSystemStatus();
+
     // Create FreeRTOS tasks
     xTaskCreate(dataCollectionTask, "DataCollection", 4096, nullptr, 2, &dataCollectionTaskHandle);
     xTaskCreate(communicationTask, "Communication", 4096, nullptr, 3, &communicationTaskHandle);
     xTaskCreate(mainLoopTask, "MainLoop", 4096, nullptr, 1, nullptr);
-    
+
     Serial.println("Setup complete - ESP32 Ground Station is running");
+#ifdef TEST_MODE
+    Serial.println("TEST MODE: Waiting for binary commands on Serial...");
+#else
     Serial.println("Type 'help' for available commands");
+#endif
 }
 
 // ====================================================================
@@ -178,6 +264,9 @@ void setupSerial() {
     Serial.println();
 }
 
+#ifndef TEST_MODE
+// All sensor initialization functions only in normal mode
+
 void setupSPI() {
     SPI.begin(SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN);
     Serial.println("SPI initialized");
@@ -190,37 +279,37 @@ void setupI2C() {
 
 void initializeLoRa() {
     LoRa.setPins(LORA_CS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
-    
+
     if (!LoRa.begin(LORA_FREQUENCY)) {
         Serial.println("LoRa 915MHz: Failed to initialize");
         loraInitialized = false;
         return;
     }
-    
+
     LoRa.setSignalBandwidth(LORA_BANDWIDTH);
     LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
     LoRa.setCodingRate4(LORA_CODING_RATE);
     LoRa.setTxPower(LORA_TX_POWER);
     LoRa.enableCrc();
-    
+
     loraInitialized = true;
     Serial.println("LoRa 915MHz: Initialized successfully");
 }
 
 void initializeRadio433() {
-    int state = radio433Module.begin(RADIO433_FREQUENCY, RADIO433_BITRATE, 
+    int state = radio433Module.begin(RADIO433_FREQUENCY, RADIO433_BITRATE,
                                     RADIO433_FREQ_DEV, 125.0, 10, 32);
-    
+
     if (state != RADIOLIB_ERR_NONE) {
         Serial.printf("Radio433: Failed to initialize (error: %d)\n", state);
         radio433Initialized = false;
         return;
     }
-    
+
     radio433Module.setEncoding(RADIOLIB_ENCODING_NRZ);
     radio433Module.setCRC(true);
     radio433Module.startReceive();
-    
+
     radio433Initialized = true;
     Serial.println("Radio433: Initialized successfully");
 }
@@ -250,14 +339,15 @@ void initializeBarometer() {
 void initializeCurrentSensor() {
     analogReadResolution(12);
     analogSetAttenuation(ADC_11db);
-    
+
     // Initialize sample arrays
     memset(voltageSamples, 0, sizeof(voltageSamples));
     memset(currentSamples, 0, sizeof(currentSamples));
-    
+
     currentSensorInitialized = true;
     Serial.println("CurrentSensor: Initialized successfully");
 }
+#endif // TEST_MODE
 
 
 
@@ -267,35 +357,53 @@ void initializeCurrentSensor() {
 
 void dataCollectionTask(void* parameters) {
     while (true) {
+#ifndef TEST_MODE
+        // Only poll sensors in normal mode
         if (loraInitialized) {
             checkLoRaPackets();
         }
-        
+
         if (radio433Initialized) {
             checkRadio433Packets();
         }
-        
+
         if (barometerInitialized) {
             updateBarometer();
         }
-        
+
         if (currentSensorInitialized) {
             updateCurrentSensor();
         }
-        
+#endif
+
         static uint32_t lastStatusUpdate = 0;
         if (millis() - lastStatusUpdate > 5000) {
             updateSystemStatus();
             lastStatusUpdate = millis();
         }
-        
+
         vTaskDelay(pdMS_TO_TICKS(SENSOR_READ_INTERVAL));
     }
 }
 
 void communicationTask(void* parameters) {
+#ifdef TEST_MODE
+    static uint32_t lastHeartbeat = 0;
+#endif
     while (true) {
         commProtocol.process();
+
+#ifdef TEST_MODE
+        // Handle WiFi telnet clients
+        handleTelnetClients();
+
+        // Send binary status update every second
+        if (millis() - lastHeartbeat > 1000) {
+            commProtocol.sendStatusUpdate();
+            lastHeartbeat = millis();
+        }
+#endif
+
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -319,6 +427,9 @@ void mainLoopTask(void* parameters) {
 // ====================================================================
 // SENSOR DATA COLLECTION
 // ====================================================================
+
+#ifndef TEST_MODE
+// Sensor reading functions only in normal mode
 
 void checkLoRaPackets() {
     int packetSize = LoRa.parsePacket();
@@ -442,14 +553,15 @@ void addRadio433Packet(const Radio433Packet_t& packet) {
     if (xSemaphoreTake(radio433BufferMutex, portMAX_DELAY) == pdTRUE) {
         radio433Buffer[radio433BufferHead] = packet;
         radio433BufferHead = (radio433BufferHead + 1) % RADIO433_BUFFER_SIZE;
-        
+
         if (radio433BufferHead == radio433BufferTail) {
             radio433BufferTail = (radio433BufferTail + 1) % RADIO433_BUFFER_SIZE;
         }
-        
+
         xSemaphoreGive(radio433BufferMutex);
     }
 }
+#endif // TEST_MODE
 
 // ====================================================================
 // COMMUNICATION PROTOCOL
@@ -487,10 +599,20 @@ void printSystemStatus() {
 void printWelcomeMessage() {
     Serial.println("======================================");
     Serial.println("    ESP32 Rocketry Ground Station");
+#ifdef TEST_MODE
+    Serial.println("      **TEST MODE ENABLED**");
+    Serial.println("      No Hardware Required");
+#else
     Serial.println("       Single File Version 1.0");
+#endif
     Serial.println("======================================");
     Serial.printf("ESP32 Chip Rev: %d\n", ESP.getChipRevision());
     Serial.printf("Free Heap: %d bytes\n", ESP.getFreeHeap());
+#ifdef TEST_MODE
+    Serial.println("\nTEST MODE: All sensors simulated");
+    Serial.println("Ready for Pi protocol testing");
+    Serial.println("Waiting for commands on USB Serial...");
+#endif
     Serial.println("======================================");
 }
 
@@ -516,15 +638,23 @@ void handleSerialCommands() {
         }
         else if (command == "lora") {
             Serial.printf("LoRa Status: %s\n", loraInitialized ? "Online" : "Offline");
+#ifndef TEST_MODE
             if (loraInitialized) {
                 Serial.printf("Packets: %d, RSSI: %d dBm\n", loraPacketCount, LoRa.rssi());
             }
+#else
+            Serial.printf("Packets: %d (simulated)\n", loraPacketCount);
+#endif
         }
         else if (command == "433") {
             Serial.printf("433MHz Status: %s\n", radio433Initialized ? "Online" : "Offline");
+#ifndef TEST_MODE
             if (radio433Initialized) {
                 Serial.printf("Packets: %d, RSSI: %d dBm\n", radio433PacketCount, radio433Module.getRSSI());
             }
+#else
+            Serial.printf("Packets: %d (simulated)\n", radio433PacketCount);
+#endif
         }
         else if (command == "baro") {
             Serial.printf("Barometer Status: %s\n", barometerInitialized ? "Online" : "Offline");

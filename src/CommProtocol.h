@@ -49,7 +49,10 @@ public:
     
     // Main processing function - call this in main loop
     void process();
-    
+
+    // Unsolicited messages (for testing/heartbeat)
+    void sendStatusUpdate();
+
     // System state management
     bool isSystemAwake();
     void sendWakeupResponse();

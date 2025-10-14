@@ -4,18 +4,24 @@
 
 #include <Arduino.h>
 #include "config.h"
+
+#ifndef TEST_MODE
+// Only include sensor headers when not in test mode
 #include "sensors/LoRa915.h"
 #include "sensors/Radio433.h"
 #include "sensors/Barometer.h"
 #include "sensors/CurrentVoltageSensor.h"
+#endif
 
 class DataCollector {
 private:
+#ifndef TEST_MODE
     LoRa915* lora_module;
     Radio433* radio433_module;
     Barometer* barometer;
     CurrentVoltageSensor* current_sensor;
-    
+#endif
+
     SystemStatus_t system_status;
     uint32_t boot_time;
     
@@ -53,10 +59,12 @@ public:
     size_t packStatus(uint8_t* out, size_t max_len);
     
     // Individual sensor access
+#ifndef TEST_MODE
     LoRa915* getLoRaModule() { return lora_module; }
     Radio433* getRadio433Module() { return radio433_module; }
     Barometer* getBarometerModule() { return barometer; }
     CurrentVoltageSensor* getCurrentSensorModule() { return current_sensor; }
+#endif
     
     // Status
     const SystemStatus_t& getStatus() const { return system_status; }
