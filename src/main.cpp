@@ -27,6 +27,10 @@
 #include "DataCollector.h"
 #include "CommProtocol.h"
 
+#ifdef TEST_MODE
+#include "FlightDataReplay.h"
+#endif
+
 // ====================================================================
 // All pin definitions, constants, and data structures are in config.h
 // ====================================================================
@@ -44,6 +48,12 @@ CommProtocol commProtocol(&dataCollector, &Serial);
 // WiFi Telnet Server for remote serial monitoring
 WiFiServer telnetServer(TELNET_PORT);
 WiFiClient telnetClient;
+
+// Flight log replay state
+bool replayEnabled = false;
+int replayIndex = 0;
+uint32_t lastReplayTime = 0;
+const uint32_t REPLAY_INTERVAL_MS = 1000; // 1 line per second
 #endif
 
 #ifndef TEST_MODE
@@ -148,6 +158,54 @@ void handleTelnetClients() {
     }
 }
 
+// Callback function when WAKEUP command is received
+void onWakeupReceived() {
+    Serial.println("[REPLAY] WAKEUP received - starting flight log replay!");
+    replayEnabled = true;
+    replayIndex = 0;
+    lastReplayTime = millis();
+}
+
+// Function to send one flight log line as a LoRa packet
+void sendFlightLogLine(const char* line) {
+    // Create a fake LoRa packet from the flight log line
+    WireLoRa_t packet{};
+    packet.version = 1;
+    packet.packet_count = replayIndex;
+
+    // Parse RSSI and SNR from the line if present
+    // Format: "RSSI:-82, SNR:12 | [...]"
+    if (strncmp(line, "RSSI:", 5) == 0) {
+        packet.rssi_dbm = atoi(line + 5);
+        const char* snr_pos = strstr(line, "SNR:");
+        if (snr_pos) {
+            packet.snr_db = atof(snr_pos + 4);
+        }
+    } else {
+        packet.rssi_dbm = -85;
+        packet.snr_db = 3.5;
+    }
+
+    // Copy the entire line as packet data (truncate if needed)
+    size_t line_len = strlen(line);
+    packet.latest_len = (line_len > 64) ? 64 : line_len;
+    memcpy(packet.latest_data, line, packet.latest_len);
+
+    // Send as binary-framed LoRa packet
+    Serial.write((uint8_t)HELLO_BYTE);
+    Serial.write((uint8_t)PERIPHERAL_ID_LORA_915);
+    Serial.write((uint8_t)sizeof(WireLoRa_t));
+    Serial.write((uint8_t*)&packet, sizeof(WireLoRa_t));
+    Serial.write((uint8_t)GOODBYE_BYTE);
+    Serial.flush();
+
+    // Also print to debug
+    Serial.printf("[REPLAY] Sent line %d: %.50s%s\n",
+                  replayIndex,
+                  line,
+                  (line_len > 50) ? "..." : "");
+}
+
 // Override Serial.print functions to also send to telnet
 class TelnetSerial : public Print {
 public:
@@ -239,6 +297,10 @@ void setup() {
     Serial.println("Setup complete - ESP32 Ground Station is running");
 #ifdef TEST_MODE
     Serial.println("TEST MODE: Waiting for binary commands on Serial...");
+    Serial.println("TEST MODE: Flight log replay ready - send WAKEUP command to start");
+
+    // Register wakeup callback for flight log replay
+    commProtocol.setWakeupCallback(onWakeupReceived);
 #else
     Serial.println("Type 'help' for available commands");
 #endif
@@ -387,9 +449,8 @@ void dataCollectionTask(void* parameters) {
 }
 
 void communicationTask(void* parameters) {
-#ifdef TEST_MODE
     static uint32_t lastHeartbeat = 0;
-#endif
+
     while (true) {
         commProtocol.process();
 
@@ -397,8 +458,33 @@ void communicationTask(void* parameters) {
         // Handle WiFi telnet clients
         handleTelnetClients();
 
-        // Send binary status update every second
-        if (millis() - lastHeartbeat > 1000) {
+        // Flight log replay logic
+        if (replayEnabled) {
+            uint32_t currentTime = millis();
+            if (currentTime - lastReplayTime >= REPLAY_INTERVAL_MS) {
+                // Send the current line
+                sendFlightLogLine(flightLogLines[replayIndex]);
+
+                // Move to next line (loop back to start if at end)
+                replayIndex++;
+                if (replayIndex >= flightLogLineCount) {
+                    replayIndex = 0;
+                    Serial.println("[REPLAY] Loop complete - restarting from beginning");
+                }
+
+                lastReplayTime = currentTime;
+            }
+        }
+
+        // Send binary status update every second (only when NOT replaying, to avoid spam)
+        if (!replayEnabled && (millis() - lastHeartbeat > 1000)) {
+            commProtocol.sendStatusUpdate();
+            lastHeartbeat = millis();
+        }
+#else
+        // NORMAL MODE: Send periodic status update every 5 seconds
+        // This acts as a heartbeat to show the ESP32 is still running
+        if (millis() - lastHeartbeat > 5000) {
             commProtocol.sendStatusUpdate();
             lastHeartbeat = millis();
         }

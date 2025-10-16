@@ -21,7 +21,11 @@ DataCollector::DataCollector() :
 
     // Initialize system status
     memset(&system_status, 0, sizeof(system_status));
+#ifdef TEST_MODE
     system_status.system_state = SYSTEM_OPERATIONAL;  // Start operational in test mode
+#else
+    system_status.system_state = SYSTEM_WAITING_FOR_WAKEUP;  // Wait for wakeup in normal mode
+#endif
     boot_time = millis();
 }
 
@@ -321,6 +325,17 @@ size_t DataCollector::packCurrentData(uint8_t* out, size_t max_len) {
     memcpy(out, &w, sizeof(WireCurrent_t));
     return sizeof(WireCurrent_t);
 #endif
+}
+
+size_t DataCollector::packHeartbeat(uint8_t* out, size_t max_len) {
+    if (max_len < sizeof(WireHeartbeat_t)) return 0;
+    updateSystemStatus();
+    WireHeartbeat_t w{};
+    w.version = 1;
+    w.uptime_seconds = system_status.uptime_seconds;
+    w.system_state = (uint8_t)system_status.system_state;
+    memcpy(out, &w, sizeof(WireHeartbeat_t));
+    return sizeof(WireHeartbeat_t);
 }
 
 size_t DataCollector::packStatus(uint8_t* out, size_t max_len) {

@@ -10,7 +10,8 @@ CommProtocol::CommProtocol(DataCollector* collector, Stream* serial) :
     received_message_length(0),
     last_activity_time(0),
     hello_received_time(0),
-    response_index(0) {
+    response_index(0),
+    wakeup_callback(nullptr) {
 
     memset(message_buffer, 0, sizeof(message_buffer));
 }
@@ -145,7 +146,7 @@ void CommProtocol::processSystemCommand(uint8_t command) {
             if (n > 0) {
                 // Send framed binary payload
                 current_state = SENDING_RESPONSE;
-                serial_port->write((uint8_t)HELLO_BYTE);
+                serial_port->write((uint8_t)RESPONSE_BYTE);
                 serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
                 serial_port->write((uint8_t)n);
                 serial_port->write(buf, n);
@@ -163,7 +164,7 @@ void CommProtocol::processSystemCommand(uint8_t command) {
             size_t n = data_collector->pack433Data(buf, sizeof(buf));
             if (n > 0) {
                 current_state = SENDING_RESPONSE;
-                serial_port->write((uint8_t)HELLO_BYTE);
+                serial_port->write((uint8_t)RESPONSE_BYTE);
                 serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
                 serial_port->write((uint8_t)n);
                 serial_port->write(buf, n);
@@ -181,7 +182,7 @@ void CommProtocol::processSystemCommand(uint8_t command) {
             size_t n = data_collector->packBarometerData(buf, sizeof(buf));
             if (n > 0) {
                 current_state = SENDING_RESPONSE;
-                serial_port->write((uint8_t)HELLO_BYTE);
+                serial_port->write((uint8_t)RESPONSE_BYTE);
                 serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
                 serial_port->write((uint8_t)n);
                 serial_port->write(buf, n);
@@ -199,7 +200,7 @@ void CommProtocol::processSystemCommand(uint8_t command) {
             size_t n = data_collector->packCurrentData(buf, sizeof(buf));
             if (n > 0) {
                 current_state = SENDING_RESPONSE;
-                serial_port->write((uint8_t)HELLO_BYTE);
+                serial_port->write((uint8_t)RESPONSE_BYTE);
                 serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
                 serial_port->write((uint8_t)n);
                 serial_port->write(buf, n);
@@ -227,7 +228,7 @@ void CommProtocol::processSystemCommand(uint8_t command) {
             else off += n;
             if (off == 0) { sendErrorResponse("No data"); return; }
             current_state = SENDING_RESPONSE;
-            serial_port->write((uint8_t)HELLO_BYTE);
+            serial_port->write((uint8_t)RESPONSE_BYTE);
             serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
             serial_port->write((uint8_t)off);
             serial_port->write(buf, off);
@@ -242,7 +243,7 @@ void CommProtocol::processSystemCommand(uint8_t command) {
             size_t n = data_collector->packStatus(buf, sizeof(buf));
             if (n > 0) {
                 current_state = SENDING_RESPONSE;
-                serial_port->write((uint8_t)HELLO_BYTE);
+                serial_port->write((uint8_t)RESPONSE_BYTE);
                 serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
                 serial_port->write((uint8_t)n);
                 serial_port->write(buf, n);
@@ -252,6 +253,27 @@ void CommProtocol::processSystemCommand(uint8_t command) {
             } else {
                 sendErrorResponse("No status");
             }
+            return;
+        }
+        case CMD_SYSTEM_WAKEUP: {
+            Serial.println("CommProtocol: Processing WAKEUP command");
+            data_collector->setSystemState(SYSTEM_OPERATIONAL);
+
+            // Trigger callback if set (for TEST_MODE replay)
+            if (wakeup_callback != nullptr) {
+                wakeup_callback();
+            }
+
+            // Send acknowledgment - echo back the CMD_SYSTEM_WAKEUP byte
+            // This provides a unique, simple confirmation that the wakeup was received
+            current_state = SENDING_RESPONSE;
+            serial_port->write((uint8_t)RESPONSE_BYTE);
+            serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
+            serial_port->write((uint8_t)1);  // Length: 1 byte
+            serial_port->write((uint8_t)CMD_SYSTEM_WAKEUP);  // Echo the wakeup command
+            serial_port->write((uint8_t)GOODBYE_BYTE);
+            serial_port->flush();
+            Serial.println("CommProtocol: WAKEUP ACK sent - system operational");
             return;
         }
         default:
@@ -267,28 +289,28 @@ void CommProtocol::processSystemCommand(uint8_t command) {
 
 void CommProtocol::sendResponse(const String& response) {
     current_state = SENDING_RESPONSE;
-    
-    // Send HELLO byte
-    serial_port->write((uint8_t)HELLO_BYTE);
-    
+
+    // Send RESPONSE byte
+    serial_port->write((uint8_t)RESPONSE_BYTE);
+
     // Send peripheral ID (system response)
     serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
-    
+
     // Send response length
     uint8_t length = min((int)response.length(), 255);
     serial_port->write(length);
-    
+
     // Send response data
     if (length > 0) {
         serial_port->write((const uint8_t*)response.c_str(), length);
     }
-    
+
     // Send GOODBYE byte
     serial_port->write((uint8_t)GOODBYE_BYTE);
-    
+
     // Flush the output buffer
     serial_port->flush();
-    
+
     Serial.printf("CommProtocol: Response sent (%d bytes)\n", length);
 }
 
@@ -302,7 +324,7 @@ void CommProtocol::sendErrorResponse(const String& error_message) {
     buf[2] = (uint8_t)msg_len;
     memcpy(&buf[3], error_message.c_str(), msg_len);
     current_state = SENDING_RESPONSE;
-    serial_port->write((uint8_t)HELLO_BYTE);
+    serial_port->write((uint8_t)RESPONSE_BYTE);
     serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
     serial_port->write((uint8_t)(3 + msg_len));
     serial_port->write(buf, 3 + msg_len);
@@ -339,18 +361,39 @@ bool CommProtocol::isConnected() const {
 // }
 
 void CommProtocol::sendStatusUpdate() {
-    // Send an unsolicited status update (useful for heartbeat/testing)
+    // Send heartbeat if waiting for wakeup, otherwise send full status
     uint8_t buf[64];
-    size_t n = data_collector->packStatus(buf, sizeof(buf));
-    if (n > 0) {
-        serial_port->write((uint8_t)HELLO_BYTE);
-        serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
-        serial_port->write((uint8_t)n);
-        serial_port->write(buf, n);
-        serial_port->write((uint8_t)GOODBYE_BYTE);
-        serial_port->flush();
-        Serial.printf("CommProtocol: Sent unsolicited status update (%d bytes)\n", (int)n);
+    size_t n;
+
+    if (data_collector->getSystemState() == SYSTEM_WAITING_FOR_WAKEUP) {
+        // Before wakeup: send simple heartbeat (6 bytes)
+        n = data_collector->packHeartbeat(buf, sizeof(buf));
+        if (n > 0) {
+            serial_port->write((uint8_t)RESPONSE_BYTE);
+            serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
+            serial_port->write((uint8_t)n);
+            serial_port->write(buf, n);
+            serial_port->write((uint8_t)GOODBYE_BYTE);
+            serial_port->flush();
+            Serial.printf("CommProtocol: Sent heartbeat (%d bytes)\n", (int)n);
+        }
+    } else {
+        // After wakeup: send full status (20 bytes)
+        n = data_collector->packStatus(buf, sizeof(buf));
+        if (n > 0) {
+            serial_port->write((uint8_t)RESPONSE_BYTE);
+            serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
+            serial_port->write((uint8_t)n);
+            serial_port->write(buf, n);
+            serial_port->write((uint8_t)GOODBYE_BYTE);
+            serial_port->flush();
+            Serial.printf("CommProtocol: Sent status update (%d bytes)\n", (int)n);
+        }
     }
+}
+
+void CommProtocol::setWakeupCallback(void (*callback)()) {
+    wakeup_callback = callback;
 }
 
 void CommProtocol::printStats() {

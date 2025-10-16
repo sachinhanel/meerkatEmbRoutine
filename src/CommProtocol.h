@@ -20,7 +20,7 @@ class CommProtocol {
 private:
     Stream* serial_port;
     DataCollector* data_collector;
-    
+
     CommState_t current_state;
     uint8_t received_peripheral_id;
     uint8_t expected_message_length;
@@ -28,10 +28,13 @@ private:
     uint8_t message_buffer[256];  // Buffer for incoming message
     uint32_t last_activity_time;
     uint32_t hello_received_time;
-    
+
     // Buffer for building response
     String response_buffer;
     size_t response_index;
+
+    // Callback for WAKEUP command (for TEST_MODE replay)
+    void (*wakeup_callback)();
     
     bool validatePacket();
     void sendResponse(const String& response);
@@ -56,7 +59,8 @@ public:
     // System state management
     bool isSystemAwake();
     void sendWakeupResponse();
-    
+    void setWakeupCallback(void (*callback)());
+
     // Status functions
     bool isConnected() const;
     uint32_t getLastActivityTime() const { return last_activity_time; }

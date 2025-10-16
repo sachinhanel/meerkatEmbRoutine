@@ -56,7 +56,8 @@ public:
     size_t pack433Data(uint8_t* out, size_t max_len);
     size_t packBarometerData(uint8_t* out, size_t max_len);
     size_t packCurrentData(uint8_t* out, size_t max_len);
-    size_t packStatus(uint8_t* out, size_t max_len);
+    size_t packHeartbeat(uint8_t* out, size_t max_len);  // Simple "I'm alive" message
+    size_t packStatus(uint8_t* out, size_t max_len);     // Full status information
     
     // Individual sensor access
 #ifndef TEST_MODE

@@ -53,6 +53,7 @@
 
 // Communication Protocol Constants
 #define HELLO_BYTE      0x7E
+#define RESPONSE_BYTE   0x7D  // ESP32 -> Pi responses (different from HELLO to avoid echo confusion)
 #define GOODBYE_BYTE    0x7F
 
 // Peripheral/Origin IDs
@@ -61,23 +62,24 @@
 #define PERIPHERAL_ID_RADIO_433     0x02
 #define PERIPHERAL_ID_BAROMETER     0x03
 #define PERIPHERAL_ID_CURRENT       0x04
-#define PERIPHERAL_ID_EXTERNAL_1    0x10  // For future plug-in modules
-#define PERIPHERAL_ID_EXTERNAL_2    0x11
-#define PERIPHERAL_ID_EXTERNAL_3    0x12
+#define PERIPHERAL_ID_AIM_1         0x10  //AIM BOARD IDS
+#define PERIPHERAL_ID_AIM_2         0x11
+#define PERIPHERAL_ID_AIM_3         0x12
+#define PERIPHERAL_ID_AIM_4         0x13
 
 // System Commands (PERIPHERAL_ID_SYSTEM)
-#define CMD_SYSTEM_WAKEUP           0x01
-#define CMD_SYSTEM_STATUS           0x02
-#define CMD_SYSTEM_SLEEP            0x03
-#define CMD_SYSTEM_RESET            0x04
+#define CMD_SYSTEM_WAKEUP           0x20
+#define CMD_SYSTEM_STATUS           0x21
+#define CMD_SYSTEM_SLEEP            0x22
+#define CMD_SYSTEM_RESET            0x23
 
 // Data Request Commands
-#define CMD_GET_LORA_DATA       0x01
-#define CMD_GET_433_DATA        0x02
-#define CMD_GET_BAROMETER_DATA  0x03
-#define CMD_GET_CURRENT_DATA    0x04
-#define CMD_GET_ALL_DATA        0x05
-#define CMD_GET_STATUS          0x06
+#define CMD_GET_LORA_DATA       0x31
+#define CMD_GET_433_DATA        0x32
+#define CMD_GET_BAROMETER_DATA  0x33
+#define CMD_GET_CURRENT_DATA    0x34
+#define CMD_GET_ALL_DATA        0x35
+#define CMD_GET_STATUS          0x36
 
 // Buffer Sizes
 #define LORA_BUFFER_SIZE        256
@@ -197,6 +199,12 @@ typedef struct PACKED {
     float power_w;             // 4
     int16_t raw_adc;           // 2
 } WireCurrent_t;                // = 19 bytes
+
+typedef struct PACKED {
+    uint8_t version;           // 1
+    uint32_t uptime_seconds;   // 4
+    uint8_t system_state;      // 1
+} WireHeartbeat_t;              // = 6 bytes (minimal "I'm alive" message)
 
 typedef struct PACKED {
     uint8_t version;           // 1
