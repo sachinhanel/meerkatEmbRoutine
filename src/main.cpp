@@ -283,6 +283,9 @@ void setup() {
     dataCollector.begin();
 #endif
 
+    // Initialize communication protocol
+    commProtocol.begin();
+
     // Initialize system status
     bootTime = millis();
     updateSystemStatus();
@@ -321,9 +324,12 @@ void loop() {
 
 void setupSerial() {
     Serial.begin(115200);
-    while (!Serial) delay(10); //wait for usb serial to be ready
-    delay(1000);
+    // For ESP32-S3: add timeout to prevent hanging if Serial is not ready
+    unsigned long start = millis();
+    while (!Serial && (millis() - start < 3000)) delay(10); //wait max 3 seconds for USB serial
+    delay(500);
     Serial.println();
+    Serial.println("[DEBUG] Serial initialized!");
 }
 
 #ifndef TEST_MODE
