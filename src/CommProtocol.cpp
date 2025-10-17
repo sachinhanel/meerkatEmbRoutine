@@ -115,148 +115,66 @@ void CommProtocol::process() {
 }
 
 void CommProtocol::processMessage(uint8_t peripheral_id, const uint8_t* message_data, uint8_t length) {
-    // Route message based on peripheral ID
-    if (peripheral_id == PERIPHERAL_ID_SYSTEM) {
-        // System commands are single-byte commands
-        if (length == 1) {
-            processSystemCommand(message_data[0]);
-        } else if (length == 0) {
-            // Some commands might have no payload (like GET_STATUS)
-            processSystemCommand(0);  // Or handle differently
-        } else {
-            Serial.printf("CommProtocol: Invalid system command length: %d\n", length);
-            sendErrorResponse("Invalid command length");
-        }
-    } 
-    else {
-        // Handle other peripheral IDs here in the future
-        Serial.printf("CommProtocol: Unknown peripheral ID: 0x%02X\n", peripheral_id);
-        sendErrorResponse("Unknown peripheral");
+    // Extract command (first byte of payload)
+    if (length < 1) {
+        Serial.println("CommProtocol: Empty payload");
+        sendPeripheralErrorResponse(peripheral_id, "Empty payload");
+        return;
+    }
+
+    uint8_t command = message_data[0];
+    Serial.printf("CommProtocol: Routing to peripheral 0x%02X, command 0x%02X\n", peripheral_id, command);
+
+    // Route to appropriate peripheral handler
+    switch (peripheral_id) {
+        case PERIPHERAL_ID_SYSTEM:
+            processSystemCommand(command);
+            break;
+
+        case PERIPHERAL_ID_LORA_915:
+            processLoRa915Command(command);
+            break;
+
+        case PERIPHERAL_ID_LORA_433:
+            processLoRa433Command(command);
+            break;
+
+        case PERIPHERAL_ID_BAROMETER:
+            processBarometerCommand(command);
+            break;
+
+        case PERIPHERAL_ID_CURRENT:
+            processCurrentSensorCommand(command);
+            break;
+
+        default:
+            Serial.printf("CommProtocol: Unknown peripheral ID: 0x%02X\n", peripheral_id);
+            sendPeripheralErrorResponse(peripheral_id, "Unknown peripheral");
+            break;
     }
 }
 
+// ====================================================================
+// SYSTEM COMMAND HANDLER (peripheral_id = 0x00)
+// ====================================================================
 void CommProtocol::processSystemCommand(uint8_t command) {
-    bool success = false;
-    
+    Serial.printf("CommProtocol: Processing SYSTEM command 0x%02X\n", command);
+    uint8_t buf[64];
+    size_t n;
+
     switch (command) {
-        case CMD_GET_LORA_DATA: {
-            Serial.println("CommProtocol: Processing GET_LORA_DATA (binary)");
-            uint8_t buf[128];
-            size_t n = data_collector->packLoRaData(buf, sizeof(buf));
+        case CMD_GET_ALL:  // Same as CMD_GET_STATUS for system
+            Serial.println("  -> GET_ALL (System Status)");
+            n = data_collector->packStatus(buf, sizeof(buf));
             if (n > 0) {
-                // Send framed binary payload
-                current_state = SENDING_RESPONSE;
-                serial_port->write((uint8_t)RESPONSE_BYTE);
-                serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
-                serial_port->write((uint8_t)n);
-                serial_port->write(buf, n);
-                serial_port->write((uint8_t)GOODBYE_BYTE);
-                serial_port->flush();
-                Serial.printf("CommProtocol: Response sent (%d bytes)\n", (int)n);
+                sendPeripheralResponse(PERIPHERAL_ID_SYSTEM, buf, n);
             } else {
-                sendErrorResponse("No LoRa data");
+                sendPeripheralErrorResponse(PERIPHERAL_ID_SYSTEM, "No status");
             }
-            return;
-        }
-        case CMD_GET_433_DATA: {
-            Serial.println("CommProtocol: Processing GET_433_DATA (binary)");
-            uint8_t buf[128];
-            size_t n = data_collector->pack433Data(buf, sizeof(buf));
-            if (n > 0) {
-                current_state = SENDING_RESPONSE;
-                serial_port->write((uint8_t)RESPONSE_BYTE);
-                serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
-                serial_port->write((uint8_t)n);
-                serial_port->write(buf, n);
-                serial_port->write((uint8_t)GOODBYE_BYTE);
-                serial_port->flush();
-                Serial.printf("CommProtocol: Response sent (%d bytes)\n", (int)n);
-            } else {
-                sendErrorResponse("No 433 data");
-            }
-            return;
-        }
-        case CMD_GET_BAROMETER_DATA: {
-            Serial.println("CommProtocol: Processing GET_BAROMETER_DATA (binary)");
-            uint8_t buf[64];
-            size_t n = data_collector->packBarometerData(buf, sizeof(buf));
-            if (n > 0) {
-                current_state = SENDING_RESPONSE;
-                serial_port->write((uint8_t)RESPONSE_BYTE);
-                serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
-                serial_port->write((uint8_t)n);
-                serial_port->write(buf, n);
-                serial_port->write((uint8_t)GOODBYE_BYTE);
-                serial_port->flush();
-                Serial.printf("CommProtocol: Response sent (%d bytes)\n", (int)n);
-            } else {
-                sendErrorResponse("No barometer data");
-            }
-            return;
-        }
-        case CMD_GET_CURRENT_DATA: {
-            Serial.println("CommProtocol: Processing GET_CURRENT_DATA (binary)");
-            uint8_t buf[64];
-            size_t n = data_collector->packCurrentData(buf, sizeof(buf));
-            if (n > 0) {
-                current_state = SENDING_RESPONSE;
-                serial_port->write((uint8_t)RESPONSE_BYTE);
-                serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
-                serial_port->write((uint8_t)n);
-                serial_port->write(buf, n);
-                serial_port->write((uint8_t)GOODBYE_BYTE);
-                serial_port->flush();
-                Serial.printf("CommProtocol: Response sent (%d bytes)\n", (int)n);
-            } else {
-                sendErrorResponse("No current data");
-            }
-            return;
-        }
-        case CMD_GET_ALL_DATA: {
-            Serial.println("CommProtocol: Processing GET_ALL_DATA (binary)");
-            // Compact bundle: LoRa + 433 + Baro + Current, if size allows. Otherwise send error.
-            uint8_t buf[255];
-            size_t off = 0;
-            size_t n;
-            if ((n = data_collector->packLoRaData(buf + off, sizeof(buf) - off)) == 0) { /* ok if offline */ }
-            else off += n;
-            if ((n = data_collector->pack433Data(buf + off, sizeof(buf) - off)) == 0) { }
-            else off += n;
-            if ((n = data_collector->packBarometerData(buf + off, sizeof(buf) - off)) == 0) { }
-            else off += n;
-            if ((n = data_collector->packCurrentData(buf + off, sizeof(buf) - off)) == 0) { }
-            else off += n;
-            if (off == 0) { sendErrorResponse("No data"); return; }
-            current_state = SENDING_RESPONSE;
-            serial_port->write((uint8_t)RESPONSE_BYTE);
-            serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
-            serial_port->write((uint8_t)off);
-            serial_port->write(buf, off);
-            serial_port->write((uint8_t)GOODBYE_BYTE);
-            serial_port->flush();
-            Serial.printf("CommProtocol: Response sent (%d bytes)\n", (int)off);
-            return;
-        }
-        case CMD_GET_STATUS: {
-            Serial.println("CommProtocol: Processing GET_STATUS (binary)");
-            uint8_t buf[64];
-            size_t n = data_collector->packStatus(buf, sizeof(buf));
-            if (n > 0) {
-                current_state = SENDING_RESPONSE;
-                serial_port->write((uint8_t)RESPONSE_BYTE);
-                serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
-                serial_port->write((uint8_t)n);
-                serial_port->write(buf, n);
-                serial_port->write((uint8_t)GOODBYE_BYTE);
-                serial_port->flush();
-                Serial.printf("CommProtocol: Response sent (%d bytes)\n", (int)n);
-            } else {
-                sendErrorResponse("No status");
-            }
-            return;
-        }
-        case CMD_SYSTEM_WAKEUP: {
-            Serial.println("CommProtocol: Processing WAKEUP command");
+            break;
+
+        case CMD_SYSTEM_WAKEUP:
+            Serial.println("  -> WAKEUP");
             data_collector->setSystemState(SYSTEM_OPERATIONAL);
 
             // Trigger callback if set (for TEST_MODE replay)
@@ -265,25 +183,157 @@ void CommProtocol::processSystemCommand(uint8_t command) {
             }
 
             // Send acknowledgment - echo back the CMD_SYSTEM_WAKEUP byte
-            // This provides a unique, simple confirmation that the wakeup was received
-            current_state = SENDING_RESPONSE;
-            serial_port->write((uint8_t)RESPONSE_BYTE);
-            serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
-            serial_port->write((uint8_t)1);  // Length: 1 byte
-            serial_port->write((uint8_t)CMD_SYSTEM_WAKEUP);  // Echo the wakeup command
-            serial_port->write((uint8_t)GOODBYE_BYTE);
-            serial_port->flush();
-            Serial.println("CommProtocol: WAKEUP ACK sent - system operational");
-            return;
-        }
-        default:
-            Serial.printf("CommProtocol: Unknown command: 0x%02X\n", command);
-            sendErrorResponse("Unknown command");
-            return;
-    }
+            buf[0] = CMD_SYSTEM_WAKEUP;
+            sendPeripheralResponse(PERIPHERAL_ID_SYSTEM, buf, 1);
+            Serial.println("  -> System now OPERATIONAL");
+            break;
 
-    if (!success) {
-        sendErrorResponse("Failed to process command");
+        case CMD_SYSTEM_SLEEP:
+            Serial.println("  -> SLEEP");
+            data_collector->setSystemState(SYSTEM_SLEEPING);
+            buf[0] = CMD_SYSTEM_SLEEP;
+            sendPeripheralResponse(PERIPHERAL_ID_SYSTEM, buf, 1);
+            break;
+
+        case CMD_SYSTEM_RESET:
+            Serial.println("  -> RESET");
+            buf[0] = CMD_SYSTEM_RESET;
+            sendPeripheralResponse(PERIPHERAL_ID_SYSTEM, buf, 1);
+            delay(100);
+            ESP.restart();
+            break;
+
+        default:
+            Serial.printf("  -> Unknown system command: 0x%02X\n", command);
+            sendPeripheralErrorResponse(PERIPHERAL_ID_SYSTEM, "Unknown system command");
+            break;
+    }
+}
+
+// ====================================================================
+// 915MHz LoRa HANDLER (peripheral_id = 0x01)
+// ====================================================================
+void CommProtocol::processLoRa915Command(uint8_t command) {
+    Serial.printf("CommProtocol: Processing LoRa 915MHz command 0x%02X\n", command);
+    uint8_t buf[128];
+    size_t n;
+
+    switch (command) {
+        case CMD_GET_ALL:
+            Serial.println("  -> GET_ALL (915MHz LoRa Data)");
+            n = data_collector->packLoRaData(buf, sizeof(buf));
+            if (n > 0) {
+                sendPeripheralResponse(PERIPHERAL_ID_LORA_915, buf, n);
+            } else {
+                sendPeripheralErrorResponse(PERIPHERAL_ID_LORA_915, "No 915MHz LoRa data");
+            }
+            break;
+
+        case CMD_GET_STATUS:
+            Serial.println("  -> GET_STATUS");
+            // Future: Return LoRa module status (online, frequency, etc.)
+            sendPeripheralErrorResponse(PERIPHERAL_ID_LORA_915, "Status not implemented");
+            break;
+
+        default:
+            Serial.printf("  -> Unknown 915MHz LoRa command: 0x%02X\n", command);
+            sendPeripheralErrorResponse(PERIPHERAL_ID_LORA_915, "Unknown command");
+            break;
+    }
+}
+
+// ====================================================================
+// 433MHz LoRa HANDLER (peripheral_id = 0x02)
+// ====================================================================
+// Note: 433MHz module is same LoRa chip as 915MHz, just different frequency
+void CommProtocol::processLoRa433Command(uint8_t command) {
+    Serial.printf("CommProtocol: Processing LoRa 433MHz command 0x%02X\n", command);
+    uint8_t buf[128];
+    size_t n;
+
+    switch (command) {
+        case CMD_GET_ALL:
+            Serial.println("  -> GET_ALL (433MHz LoRa Data)");
+            n = data_collector->pack433Data(buf, sizeof(buf));
+            if (n > 0) {
+                sendPeripheralResponse(PERIPHERAL_ID_LORA_433, buf, n);
+            } else {
+                sendPeripheralErrorResponse(PERIPHERAL_ID_LORA_433, "No 433MHz LoRa data");
+            }
+            break;
+
+        case CMD_GET_STATUS:
+            Serial.println("  -> GET_STATUS");
+            // Future: Return LoRa module status (online, frequency, etc.)
+            sendPeripheralErrorResponse(PERIPHERAL_ID_LORA_433, "Status not implemented");
+            break;
+
+        default:
+            Serial.printf("  -> Unknown 433MHz LoRa command: 0x%02X\n", command);
+            sendPeripheralErrorResponse(PERIPHERAL_ID_LORA_433, "Unknown command");
+            break;
+    }
+}
+
+// ====================================================================
+// BAROMETER HANDLER (peripheral_id = 0x03)
+// ====================================================================
+void CommProtocol::processBarometerCommand(uint8_t command) {
+    Serial.printf("CommProtocol: Processing BAROMETER command 0x%02X\n", command);
+    uint8_t buf[64];
+    size_t n;
+
+    switch (command) {
+        case CMD_GET_ALL:
+            Serial.println("  -> GET_ALL (Barometer Data)");
+            n = data_collector->packBarometerData(buf, sizeof(buf));
+            if (n > 0) {
+                sendPeripheralResponse(PERIPHERAL_ID_BAROMETER, buf, n);
+            } else {
+                sendPeripheralErrorResponse(PERIPHERAL_ID_BAROMETER, "No barometer data");
+            }
+            break;
+
+        case CMD_GET_STATUS:
+            Serial.println("  -> GET_STATUS");
+            sendPeripheralErrorResponse(PERIPHERAL_ID_BAROMETER, "Status not implemented");
+            break;
+
+        default:
+            Serial.printf("  -> Unknown barometer command: 0x%02X\n", command);
+            sendPeripheralErrorResponse(PERIPHERAL_ID_BAROMETER, "Unknown command");
+            break;
+    }
+}
+
+// ====================================================================
+// CURRENT SENSOR HANDLER (peripheral_id = 0x04)
+// ====================================================================
+void CommProtocol::processCurrentSensorCommand(uint8_t command) {
+    Serial.printf("CommProtocol: Processing CURRENT SENSOR command 0x%02X\n", command);
+    uint8_t buf[64];
+    size_t n;
+
+    switch (command) {
+        case CMD_GET_ALL:
+            Serial.println("  -> GET_ALL (Current/Voltage Data)");
+            n = data_collector->packCurrentData(buf, sizeof(buf));
+            if (n > 0) {
+                sendPeripheralResponse(PERIPHERAL_ID_CURRENT, buf, n);
+            } else {
+                sendPeripheralErrorResponse(PERIPHERAL_ID_CURRENT, "No current sensor data");
+            }
+            break;
+
+        case CMD_GET_STATUS:
+            Serial.println("  -> GET_STATUS");
+            sendPeripheralErrorResponse(PERIPHERAL_ID_CURRENT, "Status not implemented");
+            break;
+
+        default:
+            Serial.printf("  -> Unknown current sensor command: 0x%02X\n", command);
+            sendPeripheralErrorResponse(PERIPHERAL_ID_CURRENT, "Unknown command");
+            break;
     }
 }
 
@@ -315,6 +365,10 @@ void CommProtocol::sendResponse(const String& response) {
 }
 
 void CommProtocol::sendErrorResponse(const String& error_message) {
+    sendPeripheralErrorResponse(PERIPHERAL_ID_SYSTEM, error_message);
+}
+
+void CommProtocol::sendPeripheralErrorResponse(uint8_t peripheral_id, const String& error_message) {
     // Minimal binary error: version(1)=1, code(1)=1, len(1)=min(50), ascii message bytes (truncated)
     uint8_t buf[64];
     size_t msg_len = error_message.length();
@@ -325,11 +379,25 @@ void CommProtocol::sendErrorResponse(const String& error_message) {
     memcpy(&buf[3], error_message.c_str(), msg_len);
     current_state = SENDING_RESPONSE;
     serial_port->write((uint8_t)RESPONSE_BYTE);
-    serial_port->write((uint8_t)PERIPHERAL_ID_SYSTEM);
+    serial_port->write((uint8_t)peripheral_id);  // Use the correct peripheral ID
     serial_port->write((uint8_t)(3 + msg_len));
     serial_port->write(buf, 3 + msg_len);
     serial_port->write((uint8_t)GOODBYE_BYTE);
     serial_port->flush();
+}
+
+void CommProtocol::sendPeripheralResponse(uint8_t peripheral_id, const uint8_t* data, size_t length) {
+    // Generic helper to send a response for any peripheral
+    current_state = SENDING_RESPONSE;
+    serial_port->write((uint8_t)RESPONSE_BYTE);
+    serial_port->write((uint8_t)peripheral_id);
+    serial_port->write((uint8_t)length);
+    if (length > 0) {
+        serial_port->write(data, length);
+    }
+    serial_port->write((uint8_t)GOODBYE_BYTE);
+    serial_port->flush();
+    Serial.printf("CommProtocol: Response sent for peripheral 0x%02X (%d bytes)\n", peripheral_id, (int)length);
 }
 
 void CommProtocol::resetState() {

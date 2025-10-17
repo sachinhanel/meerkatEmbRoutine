@@ -39,8 +39,18 @@ private:
     bool validatePacket();
     void sendResponse(const String& response);
     void sendErrorResponse(const String& error_message);
+    void sendPeripheralErrorResponse(uint8_t peripheral_id, const String& error_message);
+    void sendPeripheralResponse(uint8_t peripheral_id, const uint8_t* data, size_t length);
+
     void processMessage(uint8_t peripheral_id, const uint8_t* message_data, uint8_t length);
+
+    // Peripheral command handlers
     void processSystemCommand(uint8_t command);
+    void processLoRa915Command(uint8_t command);
+    void processLoRa433Command(uint8_t command);  // 433MHz is also LoRa (same chip)
+    void processBarometerCommand(uint8_t command);
+    void processCurrentSensorCommand(uint8_t command);
+
     void resetState();
     
 public:
