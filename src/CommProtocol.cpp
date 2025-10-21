@@ -1,5 +1,18 @@
 #include "CommProtocol.h"
 
+// Debug printing control - disable when using binary protocol with Pi
+// Set to false to prevent ASCII debug messages from mixing with binary data
+#define COMM_DEBUG_ENABLED false
+
+#if COMM_DEBUG_ENABLED
+    #define DEBUG_PRINT(x) Serial.print(x)
+    #define DEBUG_PRINTLN(x) Serial.println(x)
+    #define DEBUG_PRINTF(...) Serial.printf(__VA_ARGS__)
+#else
+    #define DEBUG_PRINT(x)
+    #define DEBUG_PRINTLN(x)
+    #define DEBUG_PRINTF(...)
+#endif
 
 CommProtocol::CommProtocol(DataCollector* collector, Stream* serial) :
     data_collector(collector),
@@ -25,7 +38,7 @@ bool CommProtocol::begin() {
     serial_port->setTimeout(100);
     resetState();
     
-    Serial.println("CommProtocol: USB Serial communication initialized");
+    DEBUG_PRINTLN("CommProtocol: USB Serial communication initialized");
     return true;
 }
 
@@ -37,7 +50,7 @@ void CommProtocol::process() {
     // Check for timeout
     if (current_state != WAIT_FOR_HELLO && 
         (millis() - last_activity_time > PI_COMM_TIMEOUT)) {
-        Serial.println("CommProtocol: Timeout - resetting state");
+        DEBUG_PRINTLN("CommProtocol: Timeout - resetting state");
         resetState();
         return;
     }
@@ -52,9 +65,9 @@ void CommProtocol::process() {
                 if (received_byte == HELLO_BYTE) {
                     current_state = WAIT_FOR_PERIPHERAL_ID;
                     hello_received_time = millis();
-                    Serial.println("\n>>> CommProtocol: HELLO received (0x7E)");
+                    DEBUG_PRINTLN("\n>>> CommProtocol: HELLO received (0x7E)");
                 } else {
-                    Serial.printf(">>> CommProtocol: Expected HELLO (0x%02X), got 0x%02X\n",
+                    DEBUG_PRINTF(">>> CommProtocol: Expected HELLO (0x%02X), got 0x%02X\n",
                                   HELLO_BYTE, received_byte);
                 }
                 break;
@@ -62,14 +75,14 @@ void CommProtocol::process() {
             case WAIT_FOR_PERIPHERAL_ID:
                 received_peripheral_id = received_byte;
                 current_state = WAIT_FOR_LENGTH;
-                Serial.printf(">>> Peripheral ID: 0x%02X\n", received_peripheral_id);
+                DEBUG_PRINTF(">>> Peripheral ID: 0x%02X\n", received_peripheral_id);
                 break;
 
             case WAIT_FOR_LENGTH:
                 expected_message_length = received_byte;
                 received_message_length = 0;
                 current_state = (expected_message_length > 0) ? WAIT_FOR_MESSAGE_DATA : WAIT_FOR_GOODBYE;
-                Serial.printf(">>> Message Length: %d bytes\n", expected_message_length);
+                DEBUG_PRINTF(">>> Message Length: %d bytes\n", expected_message_length);
                 break;
 
             case WAIT_FOR_MESSAGE_DATA:
@@ -80,14 +93,14 @@ void CommProtocol::process() {
 
                     if (received_message_length >= expected_message_length) {
                         current_state = WAIT_FOR_GOODBYE;
-                        Serial.printf(">>> Message Data: ");
+                        DEBUG_PRINTF(">>> Message Data: ");
                         for (uint8_t i = 0; i < received_message_length; i++) {
-                            Serial.printf("%02X ", message_buffer[i]);
+                            DEBUG_PRINTF("%02X ", message_buffer[i]);
                         }
-                        Serial.println();
+                        DEBUG_PRINTLN("");
                     }
                 } else {
-                    Serial.println("CommProtocol: Message buffer overflow");
+                    DEBUG_PRINTLN("CommProtocol: Message buffer overflow");
                     sendErrorResponse("Message too long");
                     resetState();
                 }
@@ -95,19 +108,19 @@ void CommProtocol::process() {
 
             case WAIT_FOR_GOODBYE:
                 if (received_byte == GOODBYE_BYTE) {
-                    Serial.println(">>> GOODBYE received (0x7F) - Processing command...");
+                    DEBUG_PRINTLN(">>> GOODBYE received (0x7F) - Processing command...");
                     processMessage(received_peripheral_id, message_buffer, received_message_length);
                 } else {
-                    Serial.printf(">>> Expected GOODBYE (0x%02X), got 0x%02X\n",
+                    DEBUG_PRINTF(">>> Expected GOODBYE (0x%02X), got 0x%02X\n",
                                   GOODBYE_BYTE, received_byte);
                     sendErrorResponse("Invalid packet format");
                 }
                 resetState();
                 break;
-                
+
             case SENDING_RESPONSE:
                 // Should not receive data while sending response
-                Serial.println("CommProtocol: Unexpected data while sending response");
+                DEBUG_PRINTLN("CommProtocol: Unexpected data while sending response");
                 resetState();
                 break;
         }
@@ -117,13 +130,13 @@ void CommProtocol::process() {
 void CommProtocol::processMessage(uint8_t peripheral_id, const uint8_t* message_data, uint8_t length) {
     // Extract command (first byte of payload)
     if (length < 1) {
-        Serial.println("CommProtocol: Empty payload");
+        DEBUG_PRINTLN("CommProtocol: Empty payload");
         sendPeripheralErrorResponse(peripheral_id, "Empty payload");
         return;
     }
 
     uint8_t command = message_data[0];
-    Serial.printf("CommProtocol: Routing to peripheral 0x%02X, command 0x%02X\n", peripheral_id, command);
+    DEBUG_PRINTF("CommProtocol: Routing to peripheral 0x%02X, command 0x%02X\n", peripheral_id, command);
 
     // Route to appropriate peripheral handler
     switch (peripheral_id) {
@@ -148,7 +161,7 @@ void CommProtocol::processMessage(uint8_t peripheral_id, const uint8_t* message_
             break;
 
         default:
-            Serial.printf("CommProtocol: Unknown peripheral ID: 0x%02X\n", peripheral_id);
+            DEBUG_PRINTF("CommProtocol: Unknown peripheral ID: 0x%02X\n", peripheral_id);
             sendPeripheralErrorResponse(peripheral_id, "Unknown peripheral");
             break;
     }
@@ -158,13 +171,13 @@ void CommProtocol::processMessage(uint8_t peripheral_id, const uint8_t* message_
 // SYSTEM COMMAND HANDLER (peripheral_id = 0x00)
 // ====================================================================
 void CommProtocol::processSystemCommand(uint8_t command) {
-    Serial.printf("CommProtocol: Processing SYSTEM command 0x%02X\n", command);
+    DEBUG_PRINTF("CommProtocol: Processing SYSTEM command 0x%02X\n", command);
     uint8_t buf[64];
     size_t n;
 
     switch (command) {
         case CMD_GET_ALL:  // Same as CMD_GET_STATUS for system
-            Serial.println("  -> GET_ALL (System Status)");
+            DEBUG_PRINTLN("  -> GET_ALL (System Status)");
             n = data_collector->packStatus(buf, sizeof(buf));
             if (n > 0) {
                 sendPeripheralResponse(PERIPHERAL_ID_SYSTEM, buf, n);
@@ -174,7 +187,7 @@ void CommProtocol::processSystemCommand(uint8_t command) {
             break;
 
         case CMD_SYSTEM_WAKEUP:
-            Serial.println("  -> WAKEUP");
+            DEBUG_PRINTLN("  -> WAKEUP");
             data_collector->setSystemState(SYSTEM_OPERATIONAL);
 
             // Trigger callback if set (for TEST_MODE replay)
@@ -185,18 +198,18 @@ void CommProtocol::processSystemCommand(uint8_t command) {
             // Send acknowledgment - echo back the CMD_SYSTEM_WAKEUP byte
             buf[0] = CMD_SYSTEM_WAKEUP;
             sendPeripheralResponse(PERIPHERAL_ID_SYSTEM, buf, 1);
-            Serial.println("  -> System now OPERATIONAL");
+            DEBUG_PRINTLN("  -> System now OPERATIONAL");
             break;
 
         case CMD_SYSTEM_SLEEP:
-            Serial.println("  -> SLEEP");
+            DEBUG_PRINTLN("  -> SLEEP");
             data_collector->setSystemState(SYSTEM_SLEEPING);
             buf[0] = CMD_SYSTEM_SLEEP;
             sendPeripheralResponse(PERIPHERAL_ID_SYSTEM, buf, 1);
             break;
 
         case CMD_SYSTEM_RESET:
-            Serial.println("  -> RESET");
+            DEBUG_PRINTLN("  -> RESET");
             buf[0] = CMD_SYSTEM_RESET;
             sendPeripheralResponse(PERIPHERAL_ID_SYSTEM, buf, 1);
             delay(100);
@@ -204,7 +217,7 @@ void CommProtocol::processSystemCommand(uint8_t command) {
             break;
 
         default:
-            Serial.printf("  -> Unknown system command: 0x%02X\n", command);
+            DEBUG_PRINTF("  -> Unknown system command: 0x%02X\n", command);
             sendPeripheralErrorResponse(PERIPHERAL_ID_SYSTEM, "Unknown system command");
             break;
     }
@@ -214,13 +227,13 @@ void CommProtocol::processSystemCommand(uint8_t command) {
 // 915MHz LoRa HANDLER (peripheral_id = 0x01)
 // ====================================================================
 void CommProtocol::processLoRa915Command(uint8_t command) {
-    Serial.printf("CommProtocol: Processing LoRa 915MHz command 0x%02X\n", command);
+    DEBUG_PRINTF("CommProtocol: Processing LoRa 915MHz command 0x%02X\n", command);
     uint8_t buf[128];
     size_t n;
 
     switch (command) {
         case CMD_GET_ALL:
-            Serial.println("  -> GET_ALL (915MHz LoRa Data)");
+            DEBUG_PRINTLN("  -> GET_ALL (915MHz LoRa Data)");
             n = data_collector->packLoRaData(buf, sizeof(buf));
             if (n > 0) {
                 sendPeripheralResponse(PERIPHERAL_ID_LORA_915, buf, n);
@@ -230,13 +243,13 @@ void CommProtocol::processLoRa915Command(uint8_t command) {
             break;
 
         case CMD_GET_STATUS:
-            Serial.println("  -> GET_STATUS");
+            DEBUG_PRINTLN("  -> GET_STATUS");
             // Future: Return LoRa module status (online, frequency, etc.)
             sendPeripheralErrorResponse(PERIPHERAL_ID_LORA_915, "Status not implemented");
             break;
 
         default:
-            Serial.printf("  -> Unknown 915MHz LoRa command: 0x%02X\n", command);
+            DEBUG_PRINTF("  -> Unknown 915MHz LoRa command: 0x%02X\n", command);
             sendPeripheralErrorResponse(PERIPHERAL_ID_LORA_915, "Unknown command");
             break;
     }
@@ -247,13 +260,13 @@ void CommProtocol::processLoRa915Command(uint8_t command) {
 // ====================================================================
 // Note: 433MHz module is same LoRa chip as 915MHz, just different frequency
 void CommProtocol::processLoRa433Command(uint8_t command) {
-    Serial.printf("CommProtocol: Processing LoRa 433MHz command 0x%02X\n", command);
+    DEBUG_PRINTF("CommProtocol: Processing LoRa 433MHz command 0x%02X\n", command);
     uint8_t buf[128];
     size_t n;
 
     switch (command) {
         case CMD_GET_ALL:
-            Serial.println("  -> GET_ALL (433MHz LoRa Data)");
+            DEBUG_PRINTLN("  -> GET_ALL (433MHz LoRa Data)");
             n = data_collector->pack433Data(buf, sizeof(buf));
             if (n > 0) {
                 sendPeripheralResponse(PERIPHERAL_ID_LORA_433, buf, n);
@@ -263,13 +276,13 @@ void CommProtocol::processLoRa433Command(uint8_t command) {
             break;
 
         case CMD_GET_STATUS:
-            Serial.println("  -> GET_STATUS");
+            DEBUG_PRINTLN("  -> GET_STATUS");
             // Future: Return LoRa module status (online, frequency, etc.)
             sendPeripheralErrorResponse(PERIPHERAL_ID_LORA_433, "Status not implemented");
             break;
 
         default:
-            Serial.printf("  -> Unknown 433MHz LoRa command: 0x%02X\n", command);
+            DEBUG_PRINTF("  -> Unknown 433MHz LoRa command: 0x%02X\n", command);
             sendPeripheralErrorResponse(PERIPHERAL_ID_LORA_433, "Unknown command");
             break;
     }
@@ -279,13 +292,13 @@ void CommProtocol::processLoRa433Command(uint8_t command) {
 // BAROMETER HANDLER (peripheral_id = 0x03)
 // ====================================================================
 void CommProtocol::processBarometerCommand(uint8_t command) {
-    Serial.printf("CommProtocol: Processing BAROMETER command 0x%02X\n", command);
+    DEBUG_PRINTF("CommProtocol: Processing BAROMETER command 0x%02X\n", command);
     uint8_t buf[64];
     size_t n;
 
     switch (command) {
         case CMD_GET_ALL:
-            Serial.println("  -> GET_ALL (Barometer Data)");
+            DEBUG_PRINTLN("  -> GET_ALL (Barometer Data)");
             n = data_collector->packBarometerData(buf, sizeof(buf));
             if (n > 0) {
                 sendPeripheralResponse(PERIPHERAL_ID_BAROMETER, buf, n);
@@ -295,12 +308,12 @@ void CommProtocol::processBarometerCommand(uint8_t command) {
             break;
 
         case CMD_GET_STATUS:
-            Serial.println("  -> GET_STATUS");
+            DEBUG_PRINTLN("  -> GET_STATUS");
             sendPeripheralErrorResponse(PERIPHERAL_ID_BAROMETER, "Status not implemented");
             break;
 
         default:
-            Serial.printf("  -> Unknown barometer command: 0x%02X\n", command);
+            DEBUG_PRINTF("  -> Unknown barometer command: 0x%02X\n", command);
             sendPeripheralErrorResponse(PERIPHERAL_ID_BAROMETER, "Unknown command");
             break;
     }
@@ -310,13 +323,13 @@ void CommProtocol::processBarometerCommand(uint8_t command) {
 // CURRENT SENSOR HANDLER (peripheral_id = 0x04)
 // ====================================================================
 void CommProtocol::processCurrentSensorCommand(uint8_t command) {
-    Serial.printf("CommProtocol: Processing CURRENT SENSOR command 0x%02X\n", command);
+    DEBUG_PRINTF("CommProtocol: Processing CURRENT SENSOR command 0x%02X\n", command);
     uint8_t buf[64];
     size_t n;
 
     switch (command) {
         case CMD_GET_ALL:
-            Serial.println("  -> GET_ALL (Current/Voltage Data)");
+            DEBUG_PRINTLN("  -> GET_ALL (Current/Voltage Data)");
             n = data_collector->packCurrentData(buf, sizeof(buf));
             if (n > 0) {
                 sendPeripheralResponse(PERIPHERAL_ID_CURRENT, buf, n);
@@ -326,12 +339,12 @@ void CommProtocol::processCurrentSensorCommand(uint8_t command) {
             break;
 
         case CMD_GET_STATUS:
-            Serial.println("  -> GET_STATUS");
+            DEBUG_PRINTLN("  -> GET_STATUS");
             sendPeripheralErrorResponse(PERIPHERAL_ID_CURRENT, "Status not implemented");
             break;
 
         default:
-            Serial.printf("  -> Unknown current sensor command: 0x%02X\n", command);
+            DEBUG_PRINTF("  -> Unknown current sensor command: 0x%02X\n", command);
             sendPeripheralErrorResponse(PERIPHERAL_ID_CURRENT, "Unknown command");
             break;
     }
@@ -361,7 +374,10 @@ void CommProtocol::sendResponse(const String& response) {
     // Flush the output buffer
     serial_port->flush();
 
-    Serial.printf("CommProtocol: Response sent (%d bytes)\n", length);
+    DEBUG_PRINTF("CommProtocol: Response sent (%d bytes)\n", length);
+
+    // Reset state machine to accept next command
+    resetState();
 }
 
 void CommProtocol::sendErrorResponse(const String& error_message) {
@@ -384,6 +400,9 @@ void CommProtocol::sendPeripheralErrorResponse(uint8_t peripheral_id, const Stri
     serial_port->write(buf, 3 + msg_len);
     serial_port->write((uint8_t)GOODBYE_BYTE);
     serial_port->flush();
+
+    // Reset state machine to accept next command
+    resetState();
 }
 
 void CommProtocol::sendPeripheralResponse(uint8_t peripheral_id, const uint8_t* data, size_t length) {
@@ -397,7 +416,10 @@ void CommProtocol::sendPeripheralResponse(uint8_t peripheral_id, const uint8_t* 
     }
     serial_port->write((uint8_t)GOODBYE_BYTE);
     serial_port->flush();
-    Serial.printf("CommProtocol: Response sent for peripheral 0x%02X (%d bytes)\n", peripheral_id, (int)length);
+    DEBUG_PRINTF("CommProtocol: Response sent for peripheral 0x%02X (%d bytes)\n", peripheral_id, (int)length);
+
+    // Reset state machine to accept next command
+    resetState();
 }
 
 void CommProtocol::resetState() {
@@ -425,7 +447,7 @@ bool CommProtocol::isConnected() const {
 //     serializeJson(test_doc, test_response);
 //     sendResponse(test_response);
     
-//     Serial.println("CommProtocol: Test message sent");
+//     DEBUG_PRINTLN("CommProtocol: Test message sent");
 // }
 
 void CommProtocol::sendStatusUpdate() {
@@ -443,7 +465,7 @@ void CommProtocol::sendStatusUpdate() {
             serial_port->write(buf, n);
             serial_port->write((uint8_t)GOODBYE_BYTE);
             serial_port->flush();
-            Serial.printf("CommProtocol: Sent heartbeat (%d bytes)\n", (int)n);
+            DEBUG_PRINTF("CommProtocol: Sent heartbeat (%d bytes)\n", (int)n);
         }
     } else {
         // After wakeup: send full status (20 bytes)
@@ -455,7 +477,7 @@ void CommProtocol::sendStatusUpdate() {
             serial_port->write(buf, n);
             serial_port->write((uint8_t)GOODBYE_BYTE);
             serial_port->flush();
-            Serial.printf("CommProtocol: Sent status update (%d bytes)\n", (int)n);
+            DEBUG_PRINTF("CommProtocol: Sent status update (%d bytes)\n", (int)n);
         }
     }
 }
@@ -465,8 +487,8 @@ void CommProtocol::setWakeupCallback(void (*callback)()) {
 }
 
 void CommProtocol::printStats() {
-    Serial.println("=== Communication Protocol Stats ===");
-    Serial.printf("Current State: ");
+    DEBUG_PRINTLN("=== Communication Protocol Stats ===");
+    DEBUG_PRINTF("Current State: ");
     switch (current_state) {
         case WAIT_FOR_HELLO: Serial.println("WAIT_FOR_HELLO"); break;
         case WAIT_FOR_PERIPHERAL_ID: Serial.println("WAIT_FOR_PERIPHERAL_ID"); break;
@@ -476,8 +498,8 @@ void CommProtocol::printStats() {
         case SENDING_RESPONSE: Serial.println("SENDING_RESPONSE"); break;
         default: Serial.println("UNKNOWN"); break;
     }
-    Serial.printf("Last Activity: %d ms ago\n", millis() - last_activity_time);
-    Serial.printf("Connected: %s\n", isConnected() ? "Yes" : "No");
-    Serial.printf("Serial Available: %d bytes\n", serial_port->available());
-    Serial.println("====================================");
+    DEBUG_PRINTF("Last Activity: %d ms ago\n", millis() - last_activity_time);
+    DEBUG_PRINTF("Connected: %s\n", isConnected() ? "Yes" : "No");
+    DEBUG_PRINTF("Serial Available: %d bytes\n", serial_port->available());
+    DEBUG_PRINTLN("====================================");
 }

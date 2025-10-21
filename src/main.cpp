@@ -314,7 +314,10 @@ void setup() {
 // ====================================================================
 
 void loop() {
-    handleSerialCommands();
+    // DISABLED: handleSerialCommands() interferes with binary protocol
+    // The binary protocol (CommProtocol) handles all serial communication
+    // If you need debug commands, use a separate serial port or re-enable in non-protocol mode
+    // handleSerialCommands();
     delay(100);
 }
 
@@ -483,17 +486,19 @@ void communicationTask(void* parameters) {
         }
 
         // Send binary status update every second (only when NOT replaying, to avoid spam)
-        if (!replayEnabled && (millis() - lastHeartbeat > 1000)) {
-            commProtocol.sendStatusUpdate();
-            lastHeartbeat = millis();
-        }
+        // TEMPORARILY DISABLED
+        // if (!replayEnabled && (millis() - lastHeartbeat > 1000)) {
+        //     commProtocol.sendStatusUpdate();
+        //     lastHeartbeat = millis();
+        // }
 #else
         // NORMAL MODE: Send periodic status update every 5 seconds
         // This acts as a heartbeat to show the ESP32 is still running
-        if (millis() - lastHeartbeat > 5000) {
-            commProtocol.sendStatusUpdate();
-            lastHeartbeat = millis();
-        }
+        // TEMPORARILY DISABLED
+        // if (millis() - lastHeartbeat > 5000) {
+        //     commProtocol.sendStatusUpdate();
+        //     lastHeartbeat = millis();
+        // }
 #endif
 
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -502,16 +507,17 @@ void communicationTask(void* parameters) {
 
 void mainLoopTask(void* parameters) {
     uint32_t lastStatusPrint = 0;
-    
+
     while (true) {
-        if (millis() - lastStatusPrint > 30000) {
-            Serial.println("\n--- System Status Update ---");
-            printSystemStatus();
-            Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
-            Serial.println("---------------------------\n");
-            lastStatusPrint = millis();
-        }
-        
+        // TEMPORARILY DISABLED - automatic status printing
+        // if (millis() - lastStatusPrint > 30000) {
+        //     Serial.println("\n--- System Status Update ---");
+        //     printSystemStatus();
+        //     Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+        //     Serial.println("---------------------------\n");
+        //     lastStatusPrint = millis();
+        // }
+
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -538,8 +544,8 @@ void checkLoRaPackets() {
         
         addLoRaPacket(newPacket);
         loraPacketCount++;
-        
-        Serial.printf("LoRa RX: %d bytes, RSSI: %d dBm, SNR: %.2f dB\n", 
+
+        Serial.printf("LoRa RX: %d bytes, RSSI: %d dBm, SNR: %.2f dB\n",
                       newPacket.data_length, newPacket.rssi, newPacket.snr);
     }
 }
