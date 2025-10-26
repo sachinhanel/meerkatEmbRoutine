@@ -137,24 +137,29 @@
 #define PERIPHERAL_ID_AIM_2         0x11  // AIM board 2 (future)
 #define PERIPHERAL_ID_AIM_3         0x12  // AIM board 3 (future)
 #define PERIPHERAL_ID_AIM_4         0x13  // AIM board 4 (future)
+#define PERIPHERAL_ID_ALL           0xFF  // Special ID: targets all sensor peripherals
 
 // Backward compatibility alias
 #define PERIPHERAL_ID_RADIO_433     PERIPHERAL_ID_LORA_433
 
 // ====================================================================
-// GENERIC COMMANDS - Work for ALL peripherals (0x00-0x0F)
+// GENERIC COMMANDS - Work for SENSOR peripherals ONLY (0x00-0x0F)
+// NOT for SYSTEM peripheral (use 0x20-0x2F for system commands)
 // ====================================================================
-#define CMD_GET_ALL         0x00  // Get all available data from this peripheral
+#define CMD_GET_ALL         0x00  // Get all available data from this peripheral (one-time)
 #define CMD_GET_STATUS      0x01  // Get status/health of this peripheral
-#define CMD_RESET           0x02  // Reset this peripheral
-#define CMD_CONFIGURE       0x03  // Configure peripheral (future - payload contains config)
+#define CMD_SET_POLL_RATE   0x02  // Set autonomous polling rate (payload: 2 bytes interval_ms)
+#define CMD_STOP_POLL       0x03  // Stop autonomous polling (no payload)
+// 0x04-0x0F reserved for future generic commands
 
 // ====================================================================
 // SYSTEM COMMANDS - Only for PERIPHERAL_ID_SYSTEM (0x20-0x2F)
 // ====================================================================
-#define CMD_SYSTEM_WAKEUP   0x20  // Wake up system from low-power state
-#define CMD_SYSTEM_SLEEP    0x21  // Put system into low-power state
-#define CMD_SYSTEM_RESET    0x22  // Reset entire ESP32
+#define CMD_SYSTEM_STATUS   0x20  // Get full WireStatus_t (20 bytes)
+#define CMD_SYSTEM_WAKEUP   0x21  // Wake up system from low-power state
+#define CMD_SYSTEM_SLEEP    0x22  // Put system into low-power state
+#define CMD_SYSTEM_RESET    0x23  // Reset entire ESP32
+// 0x24-0x2F reserved for future system commands
 
 // ====================================================================
 // PERIPHERAL-SPECIFIC COMMANDS (0x10-0x1F) - Future expansion

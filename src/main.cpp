@@ -26,9 +26,26 @@
 //brings in config.h and its def also
 #include "DataCollector.h"
 #include "CommProtocol.h"
+#include "PollingManager.h"
 
 #ifdef TEST_MODE
 #include "FlightDataReplay.h"
+#endif
+
+// ====================================================================
+// Debug printing control - disable to prevent ASCII mixing with binary protocol
+// ====================================================================
+#define MAIN_DEBUG_ENABLED false
+#define REPLAY_ENABLED false  // Disable flight data replay
+
+#if MAIN_DEBUG_ENABLED
+    #define MAIN_DEBUG_PRINT(x) Serial.print(x)
+    #define MAIN_DEBUG_PRINTLN(x) Serial.println(x)
+    #define MAIN_DEBUG_PRINTF(...) Serial.printf(__VA_ARGS__)
+#else
+    #define MAIN_DEBUG_PRINT(x)
+    #define MAIN_DEBUG_PRINTLN(x)
+    #define MAIN_DEBUG_PRINTF(...)
 #endif
 
 // ====================================================================
@@ -109,6 +126,19 @@ SemaphoreHandle_t barometerDataMutex;
 SemaphoreHandle_t currentDataMutex;
 
 // ====================================================================
+// AUTONOMOUS POLLING SYSTEM
+// ====================================================================
+struct PollConfig {
+    uint8_t peripheral_id;      // Which peripheral to poll
+    uint16_t interval_ms;       // Polling interval in milliseconds
+    uint32_t last_poll_time;    // Last time data was sent (millis)
+    bool active;                // Is this poll entry active?
+};
+
+#define MAX_POLL_ENTRIES 4  // One per sensor: LORA_915, LORA_433, BAROMETER, CURRENT
+PollConfig pollList[MAX_POLL_ENTRIES];
+
+// ====================================================================
 // FORWARD DECLARATIONS
 // ====================================================================
 
@@ -132,6 +162,11 @@ void checkRadio433Packets();
 void updateBarometer();
 void updateCurrentSensor();
 
+// Polling system functions
+void initPollList();
+void addToPollList(uint8_t peripheral_id, uint16_t interval_ms);
+void removeFromPollList(uint8_t peripheral_id);
+void checkAndSendPollingData();
 
 void addLoRaPacket(const LoRaPacket_t& packet);
 void addRadio433Packet(const Radio433Packet_t& packet);
@@ -151,7 +186,7 @@ void handleTelnetClients() {
             telnetClient.stop();
         }
         telnetClient = telnetServer.available();
-        Serial.println("\n[WiFi] Telnet client connected!");
+        MAIN_DEBUG_PRINTLN("\n[WiFi] Telnet client connected!");
         telnetClient.println("=== ESP32 Remote Serial Monitor ===");
         telnetClient.printf("Connected to: %s\n", WiFi.localIP().toString().c_str());
         telnetClient.println("===================================\n");
@@ -160,10 +195,12 @@ void handleTelnetClients() {
 
 // Callback function when WAKEUP command is received
 void onWakeupReceived() {
-    Serial.println("[REPLAY] WAKEUP received - starting flight log replay!");
+    #if REPLAY_ENABLED
+    MAIN_DEBUG_PRINTLN("[REPLAY] WAKEUP received - starting flight log replay!");
     replayEnabled = true;
     replayIndex = 0;
     lastReplayTime = millis();
+    #endif
 }
 
 // Function to send one flight log line as a LoRa packet
@@ -200,7 +237,7 @@ void sendFlightLogLine(const char* line) {
     Serial.flush();
 
     // Also print to debug
-    Serial.printf("[REPLAY] Sent line %d: %.50s%s\n",
+    MAIN_DEBUG_PRINTF("[REPLAY] Sent line %d: %.50s%s\n",
                   replayIndex,
                   line,
                   (line_len > 50) ? "..." : "");
@@ -262,6 +299,9 @@ void setup() {
 
     // TEST MODE: Initialize DataCollector with fake sensors
     dataCollector.begin();
+
+    // Initialize polling system
+    initPollList();
 #else
     // NORMAL MODE: Initialize communication buses
     setupSPI();
@@ -281,6 +321,9 @@ void setup() {
 
     // Initialize DataCollector with real sensors
     dataCollector.begin();
+
+    // Initialize polling system
+    initPollList();
 #endif
 
     // Initialize communication protocol
@@ -307,6 +350,133 @@ void setup() {
 #else
     Serial.println("Type 'help' for available commands");
 #endif
+}
+
+// ====================================================================
+// POLLING SYSTEM HELPER FUNCTIONS
+// ====================================================================
+
+void initPollList() {
+    for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
+        pollList[i].peripheral_id = 0;
+        pollList[i].interval_ms = 0;
+        pollList[i].last_poll_time = 0;
+        pollList[i].active = false;
+    }
+}
+
+void addToPollList(uint8_t peripheral_id, uint16_t interval_ms) {
+    // First check if this peripheral already exists in the list
+    for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
+        if (pollList[i].active && pollList[i].peripheral_id == peripheral_id) {
+            // Update existing entry
+            pollList[i].interval_ms = interval_ms;
+            pollList[i].last_poll_time = millis();
+            return;
+        }
+    }
+
+    // Not found, add new entry
+    for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
+        if (!pollList[i].active) {
+            pollList[i].peripheral_id = peripheral_id;
+            pollList[i].interval_ms = interval_ms;
+            pollList[i].last_poll_time = millis();
+            pollList[i].active = true;
+            return;
+        }
+    }
+
+    // Poll list is full - this shouldn't happen with only 4 sensors
+    Serial.println("ERROR: Poll list full!");
+}
+
+void removeFromPollList(uint8_t peripheral_id) {
+    for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
+        if (pollList[i].active && pollList[i].peripheral_id == peripheral_id) {
+            pollList[i].active = false;
+            return;
+        }
+    }
+}
+
+void checkAndSendPollingData() {
+    // ONLY poll if state machine is idle (not processing a command)
+    if (commProtocol.getState() != WAIT_FOR_HELLO) {
+        return;  // Busy processing command, skip this poll cycle
+    }
+
+    uint32_t now = millis();
+
+    // Check if all active entries have the same interval (poll all case)
+    bool all_same_interval = false;
+    uint16_t common_interval = 0;
+    int active_count = 0;
+
+    for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
+        if (pollList[i].active) {
+            if (active_count == 0) {
+                common_interval = pollList[i].interval_ms;
+            } else if (pollList[i].interval_ms != common_interval) {
+                common_interval = 0;  // Different intervals
+                break;
+            }
+            active_count++;
+        }
+    }
+
+    all_same_interval = (active_count > 1 && common_interval > 0);
+
+    if (all_same_interval) {
+        // Poll all sensors together with 50ms spacing between each
+        // Use the first entry's timer to control the whole group
+        int first_active = -1;
+        for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
+            if (pollList[i].active) {
+                first_active = i;
+                break;
+            }
+        }
+
+        if (first_active >= 0 && (now - pollList[first_active].last_poll_time >= common_interval)) {
+            // Send all peripherals with 50ms spacing (gives Pi time to process each message)
+            for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
+                if (pollList[i].active) {
+                    commProtocol.sendPeripheralData(pollList[i].peripheral_id);
+                    if (i < MAX_POLL_ENTRIES - 1) {  // Don't delay after last one
+                        delay(50);
+                    }
+                }
+            }
+            // Update all timers
+            for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
+                if (pollList[i].active) {
+                    pollList[i].last_poll_time = now;
+                }
+            }
+        }
+    } else {
+        // Individual polling - each peripheral on its own schedule
+        // Track last send time globally to ensure minimum 50ms spacing between ANY messages
+        static uint32_t last_global_send_time = 0;
+
+        for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
+            if (pollList[i].active) {
+                // Check if it's time to poll this peripheral
+                if (now - pollList[i].last_poll_time >= pollList[i].interval_ms) {
+                    // Ensure minimum 50ms spacing since last message (prevents Pi RX buffer overflow)
+                    uint32_t time_since_last_send = millis() - last_global_send_time;
+                    if (last_global_send_time > 0 && time_since_last_send < 50) {
+                        delay(50 - time_since_last_send);
+                    }
+
+                    commProtocol.sendPeripheralData(pollList[i].peripheral_id);
+                    pollList[i].last_poll_time = millis();
+                    last_global_send_time = millis();
+                }
+            }
+        }
+    }
 }
 
 // ====================================================================
@@ -461,13 +631,18 @@ void communicationTask(void* parameters) {
     static uint32_t lastHeartbeat = 0;
 
     while (true) {
+        // Process incoming commands
         commProtocol.process();
+
+        // Check and send autonomous polling data (state-aware)
+        checkAndSendPollingData();
 
 #ifdef TEST_MODE
         // Handle WiFi telnet clients
         handleTelnetClients();
 
-        // Flight log replay logic
+        // Flight log replay logic (DISABLED by default - set REPLAY_ENABLED=true to enable)
+        #if REPLAY_ENABLED
         if (replayEnabled) {
             uint32_t currentTime = millis();
             if (currentTime - lastReplayTime >= REPLAY_INTERVAL_MS) {
@@ -478,12 +653,13 @@ void communicationTask(void* parameters) {
                 replayIndex++;
                 if (replayIndex >= flightLogLineCount) {
                     replayIndex = 0;
-                    Serial.println("[REPLAY] Loop complete - restarting from beginning");
+                    MAIN_DEBUG_PRINTLN("[REPLAY] Loop complete - restarting from beginning");
                 }
 
                 lastReplayTime = currentTime;
             }
         }
+        #endif
 
         // Send binary status update every second (only when NOT replaying, to avoid spam)
         // TEMPORARILY DISABLED

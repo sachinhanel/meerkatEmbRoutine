@@ -45,11 +45,15 @@ private:
     void processMessage(uint8_t peripheral_id, const uint8_t* message_data, uint8_t length);
 
     // Peripheral command handlers
-    void processSystemCommand(uint8_t command);
-    void processLoRa915Command(uint8_t command);
-    void processLoRa433Command(uint8_t command);  // 433MHz is also LoRa (same chip)
-    void processBarometerCommand(uint8_t command);
-    void processCurrentSensorCommand(uint8_t command);
+    void processSystemCommand(uint8_t command, const uint8_t* payload, uint8_t payload_length);
+    void processLoRa915Command(uint8_t command, const uint8_t* payload, uint8_t payload_length);
+    void processLoRa433Command(uint8_t command, const uint8_t* payload, uint8_t payload_length);
+    void processBarometerCommand(uint8_t command, const uint8_t* payload, uint8_t payload_length);
+    void processCurrentSensorCommand(uint8_t command, const uint8_t* payload, uint8_t payload_length);
+
+    // Generic sensor command handlers (shared by all sensors)
+    void handleSetPollRate(uint8_t peripheral_id, const uint8_t* payload, uint8_t length);
+    void handleStopPoll(uint8_t peripheral_id);
 
     void resetState();
     
@@ -75,7 +79,10 @@ public:
     bool isConnected() const;
     uint32_t getLastActivityTime() const { return last_activity_time; }
     CommState_t getState() const { return current_state; }
-    
+
+    // Autonomous polling support
+    void sendPeripheralData(uint8_t peripheral_id);  // Send data for one peripheral (used by polling & GET_ALL)
+
     // Testing functions
     void sendTestMessage();
     void printStats();

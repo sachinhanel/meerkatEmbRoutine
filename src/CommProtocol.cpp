@@ -1,4 +1,5 @@
 #include "CommProtocol.h"
+#include "PollingManager.h"
 
 // Debug printing control - disable when using binary protocol with Pi
 // Set to false to prevent ASCII debug messages from mixing with binary data
@@ -103,6 +104,7 @@ void CommProtocol::process() {
                     DEBUG_PRINTLN("CommProtocol: Message buffer overflow");
                     sendErrorResponse("Message too long");
                     resetState();
+                    return;  // Exit after sending error response
                 }
                 break;
 
@@ -116,13 +118,15 @@ void CommProtocol::process() {
                     sendErrorResponse("Invalid packet format");
                 }
                 resetState();
-                break;
+                // IMPORTANT: Exit the while loop after processing message
+                // This prevents reading the next command while response is being transmitted
+                return;
 
             case SENDING_RESPONSE:
                 // Should not receive data while sending response
                 DEBUG_PRINTLN("CommProtocol: Unexpected data while sending response");
                 resetState();
-                break;
+                return;  // Exit immediately, don't continue processing
         }
     }
 }
@@ -136,28 +140,95 @@ void CommProtocol::processMessage(uint8_t peripheral_id, const uint8_t* message_
     }
 
     uint8_t command = message_data[0];
+    const uint8_t* payload = (length > 1) ? &message_data[1] : nullptr;  // Payload after command byte
+    uint8_t payload_length = (length > 1) ? length - 1 : 0;
+
     DEBUG_PRINTF("CommProtocol: Routing to peripheral 0x%02X, command 0x%02X\n", peripheral_id, command);
 
     // Route to appropriate peripheral handler
     switch (peripheral_id) {
         case PERIPHERAL_ID_SYSTEM:
-            processSystemCommand(command);
+            processSystemCommand(command, payload, payload_length);
             break;
 
         case PERIPHERAL_ID_LORA_915:
-            processLoRa915Command(command);
+            processLoRa915Command(command, payload, payload_length);
             break;
 
         case PERIPHERAL_ID_LORA_433:
-            processLoRa433Command(command);
+            processLoRa433Command(command, payload, payload_length);
             break;
 
         case PERIPHERAL_ID_BAROMETER:
-            processBarometerCommand(command);
+            processBarometerCommand(command, payload, payload_length);
             break;
 
         case PERIPHERAL_ID_CURRENT:
-            processCurrentSensorCommand(command);
+            processCurrentSensorCommand(command, payload, payload_length);
+            break;
+
+        case PERIPHERAL_ID_ALL:
+            // Special case: ALL targets all sensor peripherals
+            DEBUG_PRINTLN("CommProtocol: Command for ALL peripherals");
+            switch (command) {
+                case CMD_GET_ALL:
+                    DEBUG_PRINTLN("  -> GET_ALL on ALL (sending all sensors with 50ms spacing)");
+                    sendPeripheralData(PERIPHERAL_ID_LORA_915);
+                    delay(50);
+                    sendPeripheralData(PERIPHERAL_ID_LORA_433);
+                    delay(50);
+                    sendPeripheralData(PERIPHERAL_ID_BAROMETER);
+                    delay(50);
+                    sendPeripheralData(PERIPHERAL_ID_CURRENT);
+                    break;
+
+                case CMD_GET_STATUS: {
+                    DEBUG_PRINTLN("  -> GET_STATUS on ALL (returning bitmask)");
+                    // Return 1-byte bitmask of peripheral health
+                    uint8_t status = 0;
+                    // TODO: Check actual peripheral status
+                    // For now, assume all online in TEST_MODE
+                    #ifdef TEST_MODE
+                    status = 0x0F;  // All 4 sensors online (bits 0-3)
+                    #endif
+                    sendPeripheralResponse(PERIPHERAL_ID_ALL, &status, 1);
+                    break;
+                }
+
+                case CMD_SET_POLL_RATE: {
+                    DEBUG_PRINTLN("  -> SET_POLL_RATE on ALL");
+                    // Set same interval for all sensors
+                    if (payload_length == 2) {
+                        uint16_t interval_ms = payload[0] | (payload[1] << 8);
+                        addToPollList(PERIPHERAL_ID_LORA_915, interval_ms);
+                        addToPollList(PERIPHERAL_ID_LORA_433, interval_ms);
+                        addToPollList(PERIPHERAL_ID_BAROMETER, interval_ms);
+                        addToPollList(PERIPHERAL_ID_CURRENT, interval_ms);
+                        uint8_t ack = 0x01;  // SUCCESS
+                        sendPeripheralResponse(PERIPHERAL_ID_ALL, &ack, 1);
+                    } else {
+                        uint8_t ack = 0x00;  // FAIL
+                        sendPeripheralResponse(PERIPHERAL_ID_ALL, &ack, 1);
+                    }
+                    break;
+                }
+
+                case CMD_STOP_POLL: {
+                    DEBUG_PRINTLN("  -> STOP_POLL on ALL");
+                    removeFromPollList(PERIPHERAL_ID_LORA_915);
+                    removeFromPollList(PERIPHERAL_ID_LORA_433);
+                    removeFromPollList(PERIPHERAL_ID_BAROMETER);
+                    removeFromPollList(PERIPHERAL_ID_CURRENT);
+                    uint8_t ack = 0x01;  // SUCCESS
+                    sendPeripheralResponse(PERIPHERAL_ID_ALL, &ack, 1);
+                    break;
+                }
+
+                default:
+                    DEBUG_PRINTF("  -> Unknown command 0x%02X for ALL\n", command);
+                    sendPeripheralErrorResponse(PERIPHERAL_ID_ALL, "Unknown command");
+                    break;
+            }
             break;
 
         default:
@@ -169,15 +240,18 @@ void CommProtocol::processMessage(uint8_t peripheral_id, const uint8_t* message_
 
 // ====================================================================
 // SYSTEM COMMAND HANDLER (peripheral_id = 0x00)
+// SYSTEM uses command range 0x20-0x2F (NOT 0x00-0x0F like sensors)
 // ====================================================================
-void CommProtocol::processSystemCommand(uint8_t command) {
+void CommProtocol::processSystemCommand(uint8_t command, const uint8_t* payload, uint8_t payload_length) {
     DEBUG_PRINTF("CommProtocol: Processing SYSTEM command 0x%02X\n", command);
+    (void)payload;  // Unused for now
+    (void)payload_length;  // Unused for now
     uint8_t buf[64];
     size_t n;
 
     switch (command) {
-        case CMD_GET_ALL:  // Same as CMD_GET_STATUS for system
-            DEBUG_PRINTLN("  -> GET_ALL (System Status)");
+        case CMD_SYSTEM_STATUS:  // 0x20 - Get full WireStatus_t
+            DEBUG_PRINTLN("  -> SYSTEM_STATUS");
             n = data_collector->packStatus(buf, sizeof(buf));
             if (n > 0) {
                 sendPeripheralResponse(PERIPHERAL_ID_SYSTEM, buf, n);
@@ -186,7 +260,7 @@ void CommProtocol::processSystemCommand(uint8_t command) {
             }
             break;
 
-        case CMD_SYSTEM_WAKEUP:
+        case CMD_SYSTEM_WAKEUP:  // 0x21
             DEBUG_PRINTLN("  -> WAKEUP");
             data_collector->setSystemState(SYSTEM_OPERATIONAL);
 
@@ -201,14 +275,14 @@ void CommProtocol::processSystemCommand(uint8_t command) {
             DEBUG_PRINTLN("  -> System now OPERATIONAL");
             break;
 
-        case CMD_SYSTEM_SLEEP:
+        case CMD_SYSTEM_SLEEP:  // 0x22
             DEBUG_PRINTLN("  -> SLEEP");
             data_collector->setSystemState(SYSTEM_SLEEPING);
             buf[0] = CMD_SYSTEM_SLEEP;
             sendPeripheralResponse(PERIPHERAL_ID_SYSTEM, buf, 1);
             break;
 
-        case CMD_SYSTEM_RESET:
+        case CMD_SYSTEM_RESET:  // 0x23
             DEBUG_PRINTLN("  -> RESET");
             buf[0] = CMD_SYSTEM_RESET;
             sendPeripheralResponse(PERIPHERAL_ID_SYSTEM, buf, 1);
@@ -226,7 +300,7 @@ void CommProtocol::processSystemCommand(uint8_t command) {
 // ====================================================================
 // 915MHz LoRa HANDLER (peripheral_id = 0x01)
 // ====================================================================
-void CommProtocol::processLoRa915Command(uint8_t command) {
+void CommProtocol::processLoRa915Command(uint8_t command, const uint8_t* payload, uint8_t payload_length) {
     DEBUG_PRINTF("CommProtocol: Processing LoRa 915MHz command 0x%02X\n", command);
     uint8_t buf[128];
     size_t n;
@@ -248,6 +322,16 @@ void CommProtocol::processLoRa915Command(uint8_t command) {
             sendPeripheralErrorResponse(PERIPHERAL_ID_LORA_915, "Status not implemented");
             break;
 
+        case CMD_SET_POLL_RATE:
+            DEBUG_PRINTLN("  -> SET_POLL_RATE");
+            handleSetPollRate(PERIPHERAL_ID_LORA_915, payload, payload_length);
+            break;
+
+        case CMD_STOP_POLL:
+            DEBUG_PRINTLN("  -> STOP_POLL");
+            handleStopPoll(PERIPHERAL_ID_LORA_915);
+            break;
+
         default:
             DEBUG_PRINTF("  -> Unknown 915MHz LoRa command: 0x%02X\n", command);
             sendPeripheralErrorResponse(PERIPHERAL_ID_LORA_915, "Unknown command");
@@ -259,7 +343,7 @@ void CommProtocol::processLoRa915Command(uint8_t command) {
 // 433MHz LoRa HANDLER (peripheral_id = 0x02)
 // ====================================================================
 // Note: 433MHz module is same LoRa chip as 915MHz, just different frequency
-void CommProtocol::processLoRa433Command(uint8_t command) {
+void CommProtocol::processLoRa433Command(uint8_t command, const uint8_t* payload, uint8_t payload_length) {
     DEBUG_PRINTF("CommProtocol: Processing LoRa 433MHz command 0x%02X\n", command);
     uint8_t buf[128];
     size_t n;
@@ -281,6 +365,16 @@ void CommProtocol::processLoRa433Command(uint8_t command) {
             sendPeripheralErrorResponse(PERIPHERAL_ID_LORA_433, "Status not implemented");
             break;
 
+        case CMD_SET_POLL_RATE:
+            DEBUG_PRINTLN("  -> SET_POLL_RATE");
+            handleSetPollRate(PERIPHERAL_ID_LORA_433, payload, payload_length);
+            break;
+
+        case CMD_STOP_POLL:
+            DEBUG_PRINTLN("  -> STOP_POLL");
+            handleStopPoll(PERIPHERAL_ID_LORA_433);
+            break;
+
         default:
             DEBUG_PRINTF("  -> Unknown 433MHz LoRa command: 0x%02X\n", command);
             sendPeripheralErrorResponse(PERIPHERAL_ID_LORA_433, "Unknown command");
@@ -291,7 +385,7 @@ void CommProtocol::processLoRa433Command(uint8_t command) {
 // ====================================================================
 // BAROMETER HANDLER (peripheral_id = 0x03)
 // ====================================================================
-void CommProtocol::processBarometerCommand(uint8_t command) {
+void CommProtocol::processBarometerCommand(uint8_t command, const uint8_t* payload, uint8_t payload_length) {
     DEBUG_PRINTF("CommProtocol: Processing BAROMETER command 0x%02X\n", command);
     uint8_t buf[64];
     size_t n;
@@ -312,6 +406,16 @@ void CommProtocol::processBarometerCommand(uint8_t command) {
             sendPeripheralErrorResponse(PERIPHERAL_ID_BAROMETER, "Status not implemented");
             break;
 
+        case CMD_SET_POLL_RATE:
+            DEBUG_PRINTLN("  -> SET_POLL_RATE");
+            handleSetPollRate(PERIPHERAL_ID_BAROMETER, payload, payload_length);
+            break;
+
+        case CMD_STOP_POLL:
+            DEBUG_PRINTLN("  -> STOP_POLL");
+            handleStopPoll(PERIPHERAL_ID_BAROMETER);
+            break;
+
         default:
             DEBUG_PRINTF("  -> Unknown barometer command: 0x%02X\n", command);
             sendPeripheralErrorResponse(PERIPHERAL_ID_BAROMETER, "Unknown command");
@@ -322,7 +426,7 @@ void CommProtocol::processBarometerCommand(uint8_t command) {
 // ====================================================================
 // CURRENT SENSOR HANDLER (peripheral_id = 0x04)
 // ====================================================================
-void CommProtocol::processCurrentSensorCommand(uint8_t command) {
+void CommProtocol::processCurrentSensorCommand(uint8_t command, const uint8_t* payload, uint8_t payload_length) {
     DEBUG_PRINTF("CommProtocol: Processing CURRENT SENSOR command 0x%02X\n", command);
     uint8_t buf[64];
     size_t n;
@@ -343,11 +447,63 @@ void CommProtocol::processCurrentSensorCommand(uint8_t command) {
             sendPeripheralErrorResponse(PERIPHERAL_ID_CURRENT, "Status not implemented");
             break;
 
+        case CMD_SET_POLL_RATE:
+            DEBUG_PRINTLN("  -> SET_POLL_RATE");
+            handleSetPollRate(PERIPHERAL_ID_CURRENT, payload, payload_length);
+            break;
+
+        case CMD_STOP_POLL:
+            DEBUG_PRINTLN("  -> STOP_POLL");
+            handleStopPoll(PERIPHERAL_ID_CURRENT);
+            break;
+
         default:
             DEBUG_PRINTF("  -> Unknown current sensor command: 0x%02X\n", command);
             sendPeripheralErrorResponse(PERIPHERAL_ID_CURRENT, "Unknown command");
             break;
     }
+}
+
+// ====================================================================
+// GENERIC SENSOR COMMAND HANDLERS (shared by all sensor peripherals)
+// ====================================================================
+
+void CommProtocol::handleSetPollRate(uint8_t peripheral_id, const uint8_t* payload, uint8_t length) {
+    // Payload should be 2 bytes: little-endian uint16 interval_ms
+    if (length != 2) {
+        DEBUG_PRINTF("SET_POLL_RATE: Invalid payload length %d (expected 2)\n", length);
+        uint8_t ack = 0x00;  // FAIL
+        sendPeripheralResponse(peripheral_id, &ack, 1);
+        return;
+    }
+
+    // Parse interval_ms (little-endian)
+    uint16_t interval_ms = payload[0] | (payload[1] << 8);
+
+    DEBUG_PRINTF("SET_POLL_RATE: peripheral=0x%02X, interval=%dms\n", peripheral_id, interval_ms);
+
+    // Update poll list
+    if (interval_ms == 0) {
+        // 0ms means stop polling
+        removeFromPollList(peripheral_id);
+    } else {
+        addToPollList(peripheral_id, interval_ms);
+    }
+
+    // Send ACK
+    uint8_t ack = 0x01;  // SUCCESS
+    sendPeripheralResponse(peripheral_id, &ack, 1);
+}
+
+void CommProtocol::handleStopPoll(uint8_t peripheral_id) {
+    DEBUG_PRINTF("STOP_POLL: peripheral=0x%02X\n", peripheral_id);
+
+    // Remove from poll list
+    removeFromPollList(peripheral_id);
+
+    // Send ACK
+    uint8_t ack = 0x01;  // SUCCESS
+    sendPeripheralResponse(peripheral_id, &ack, 1);
 }
 
 void CommProtocol::sendResponse(const String& response) {
@@ -401,6 +557,9 @@ void CommProtocol::sendPeripheralErrorResponse(uint8_t peripheral_id, const Stri
     serial_port->write((uint8_t)GOODBYE_BYTE);
     serial_port->flush();
 
+    // Small delay to ensure GOODBYE byte fully transmitted over UART before next message
+    delayMicroseconds(500);  // 0.5ms safety margin for UART transmission
+
     // Reset state machine to accept next command
     resetState();
 }
@@ -416,6 +575,10 @@ void CommProtocol::sendPeripheralResponse(uint8_t peripheral_id, const uint8_t* 
     }
     serial_port->write((uint8_t)GOODBYE_BYTE);
     serial_port->flush();
+
+    // Small delay to ensure GOODBYE byte fully transmitted over UART before next message
+    delayMicroseconds(500);  // 0.5ms safety margin for UART transmission
+
     DEBUG_PRINTF("CommProtocol: Response sent for peripheral 0x%02X (%d bytes)\n", peripheral_id, (int)length);
 
     // Reset state machine to accept next command
@@ -479,6 +642,49 @@ void CommProtocol::sendStatusUpdate() {
             serial_port->flush();
             DEBUG_PRINTF("CommProtocol: Sent status update (%d bytes)\n", (int)n);
         }
+    }
+}
+
+// ====================================================================
+// SHARED FUNCTION: Send data for a single peripheral
+// Used by both GET_ALL commands and autonomous polling
+// ====================================================================
+void CommProtocol::sendPeripheralData(uint8_t peripheral_id) {
+    uint8_t buf[128];
+    size_t n = 0;
+
+    switch (peripheral_id) {
+        case PERIPHERAL_ID_LORA_915:
+            n = data_collector->packLoRaData(buf, sizeof(buf));
+            if (n > 0) {
+                sendPeripheralResponse(PERIPHERAL_ID_LORA_915, buf, n);
+            }
+            break;
+
+        case PERIPHERAL_ID_LORA_433:
+            n = data_collector->pack433Data(buf, sizeof(buf));
+            if (n > 0) {
+                sendPeripheralResponse(PERIPHERAL_ID_LORA_433, buf, n);
+            }
+            break;
+
+        case PERIPHERAL_ID_BAROMETER:
+            n = data_collector->packBarometerData(buf, sizeof(buf));
+            if (n > 0) {
+                sendPeripheralResponse(PERIPHERAL_ID_BAROMETER, buf, n);
+            }
+            break;
+
+        case PERIPHERAL_ID_CURRENT:
+            n = data_collector->packCurrentData(buf, sizeof(buf));
+            if (n > 0) {
+                sendPeripheralResponse(PERIPHERAL_ID_CURRENT, buf, n);
+            }
+            break;
+
+        default:
+            // Unknown peripheral ID, do nothing
+            break;
     }
 }
 
