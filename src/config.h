@@ -1,6 +1,13 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+// ====================================================================
+// OPERATING MODE - Uncomment to enable hybrid protocol standalone mode
+// ====================================================================
+#define HYBRID_PROTOCOL_MODE  // Standalone hybrid protocol (NO FreeRTOS)
+// When enabled, runs simple loop with hybrid protocol only
+// When disabled, runs full firmware with FreeRTOS tasks and CommProtocol
+
 // Pin Definitions for ESP32-S3
 // SPI Pins (shared between LoRa and 433MHz modules)
 #define SPI_SCK_PIN     11

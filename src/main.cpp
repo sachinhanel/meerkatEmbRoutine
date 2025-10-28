@@ -11,25 +11,35 @@
  */
 
 #include <Arduino.h>
-#include <WiFi.h>
+#include "config.h"
 
-#ifndef TEST_MODE
-// Only include hardware libraries when not in test mode
-#include <SPI.h>
-#include <Wire.h>
-#include <HardwareSerial.h>
-#include <LoRa.h>
-#include <RadioLib.h>
-#include <MS5611.h>
+#ifdef HYBRID_PROTOCOL_MODE
+    // Hybrid protocol standalone mode
+    #include "hybrid_protocol.h"
+#else
+    // Full firmware mode with FreeRTOS
+    #include <WiFi.h>
+
+    #ifndef TEST_MODE
+    // Only include hardware libraries when not in test mode
+    #include <SPI.h>
+    #include <Wire.h>
+    #include <HardwareSerial.h>
+    #include <LoRa.h>
+    #include <RadioLib.h>
+    #include <MS5611.h>
+    #endif
+
+    //brings in config.h and its def also
+    #include "DataCollector.h"
+    #include "CommProtocol.h"
+    #include "PollingManager.h"
 #endif
 
-//brings in config.h and its def also
-#include "DataCollector.h"
-#include "CommProtocol.h"
-#include "PollingManager.h"
-
+#ifndef HYBRID_PROTOCOL_MODE
 #ifdef TEST_MODE
 #include "FlightDataReplay.h"
+#endif
 #endif
 
 // ====================================================================
@@ -59,12 +69,15 @@
 
 
 DataCollector dataCollector;
+
+#ifndef HYBRID_PROTOCOL_MODE
 CommProtocol commProtocol(&dataCollector, &Serial);
+#endif
 
 #ifdef TEST_MODE
 // WiFi Telnet Server for remote serial monitoring
-WiFiServer telnetServer(TELNET_PORT);
-WiFiClient telnetClient;
+// WiFiServer telnetServer(TELNET_PORT);
+// WiFiClient telnetClient;
 
 // Flight log replay state
 bool replayEnabled = false;
@@ -178,20 +191,20 @@ void updateSystemStatus();
 
 #ifdef TEST_MODE
 // WiFi Telnet handling
-void handleTelnetClients() {
-    // Check for new clients
-    if (telnetServer.hasClient()) {
-        // Disconnect old client if exists
-        if (telnetClient && telnetClient.connected()) {
-            telnetClient.stop();
-        }
-        telnetClient = telnetServer.available();
-        MAIN_DEBUG_PRINTLN("\n[WiFi] Telnet client connected!");
-        telnetClient.println("=== ESP32 Remote Serial Monitor ===");
-        telnetClient.printf("Connected to: %s\n", WiFi.localIP().toString().c_str());
-        telnetClient.println("===================================\n");
-    }
-}
+// void handleTelnetClients() {
+//     // Check for new clients
+//     if (telnetServer.hasClient()) {
+//         // Disconnect old client if exists
+//         if (telnetClient && telnetClient.connected()) {
+//             telnetClient.stop();
+//         }
+//         telnetClient = telnetServer.available();
+//         MAIN_DEBUG_PRINTLN("\n[WiFi] Telnet client connected!");
+//         telnetClient.println("=== ESP32 Remote Serial Monitor ===");
+//         telnetClient.printf("Connected to: %s\n", WiFi.localIP().toString().c_str());
+//         telnetClient.println("===================================\n");
+//     }
+// }
 
 // Callback function when WAKEUP command is received
 void onWakeupReceived() {
@@ -244,24 +257,24 @@ void sendFlightLogLine(const char* line) {
 }
 
 // Override Serial.print functions to also send to telnet
-class TelnetSerial : public Print {
-public:
-    size_t write(uint8_t c) override {
-        size_t n = Serial.write(c);
-        if (telnetClient && telnetClient.connected()) {
-            telnetClient.write(c);
-        }
-        return n;
-    }
+// class TelnetSerial : public Print {
+// public:
+//     size_t write(uint8_t c) override {
+//         size_t n = Serial.write(c);
+//         if (telnetClient && telnetClient.connected()) {
+//             telnetClient.write(c);
+//         }
+//         return n;
+//     }
 
-    size_t write(const uint8_t *buffer, size_t size) override {
-        size_t n = Serial.write(buffer, size);
-        if (telnetClient && telnetClient.connected()) {
-            telnetClient.write(buffer, size);
-        }
-        return n;
-    }
-};
+//     size_t write(const uint8_t *buffer, size_t size) override {
+//         size_t n = Serial.write(buffer, size);
+//         if (telnetClient && telnetClient.connected()) {
+//             telnetClient.write(buffer, size);
+//         }
+//         return n;
+//     }
+// };
 #endif
 
 // ====================================================================
@@ -269,6 +282,12 @@ public:
 // ====================================================================
 
 void setup() {
+#ifdef HYBRID_PROTOCOL_MODE
+    // HYBRID PROTOCOL MODE: Run standalone test mode (NO FreeRTOS)
+    runHybridProtocolMode();
+    // Never returns - hybrid protocol runs in its own loop
+#else
+    // FULL FIRMWARE MODE: Initialize everything and start FreeRTOS tasks
     // Initialize serial communication
     setupSerial();
     printWelcomeMessage();
@@ -327,7 +346,9 @@ void setup() {
 #endif
 
     // Initialize communication protocol
+#ifndef HYBRID_PROTOCOL_MODE
     commProtocol.begin();
+#endif
 
     // Initialize system status
     bootTime = millis();
@@ -346,10 +367,13 @@ void setup() {
     Serial.println("TEST MODE: Flight log replay ready - send WAKEUP command to start");
 
     // Register wakeup callback for flight log replay
+#ifndef HYBRID_PROTOCOL_MODE
     commProtocol.setWakeupCallback(onWakeupReceived);
+#endif
 #else
     Serial.println("Type 'help' for available commands");
 #endif
+#endif // HYBRID_PROTOCOL_MODE
 }
 
 // ====================================================================
@@ -401,10 +425,12 @@ void removeFromPollList(uint8_t peripheral_id) {
 }
 
 void checkAndSendPollingData() {
+#ifndef HYBRID_PROTOCOL_MODE
     // ONLY poll if state machine is idle (not processing a command)
     if (commProtocol.getState() != WAIT_FOR_HELLO) {
         return;  // Busy processing command, skip this poll cycle
     }
+#endif
 
     uint32_t now = millis();
 
@@ -442,7 +468,9 @@ void checkAndSendPollingData() {
             // Send all peripherals with 50ms spacing (gives Pi time to process each message)
             for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
                 if (pollList[i].active) {
+#ifndef HYBRID_PROTOCOL_MODE
                     commProtocol.sendPeripheralData(pollList[i].peripheral_id);
+#endif
                     if (i < MAX_POLL_ENTRIES - 1) {  // Don't delay after last one
                         delay(50);
                     }
@@ -470,7 +498,9 @@ void checkAndSendPollingData() {
                         delay(50 - time_since_last_send);
                     }
 
+#ifndef HYBRID_PROTOCOL_MODE
                     commProtocol.sendPeripheralData(pollList[i].peripheral_id);
+#endif
                     pollList[i].last_poll_time = millis();
                     last_global_send_time = millis();
                 }
@@ -632,14 +662,16 @@ void communicationTask(void* parameters) {
 
     while (true) {
         // Process incoming commands
+#ifndef HYBRID_PROTOCOL_MODE
         commProtocol.process();
+#endif
 
         // Check and send autonomous polling data (state-aware)
         checkAndSendPollingData();
 
 #ifdef TEST_MODE
         // Handle WiFi telnet clients
-        handleTelnetClients();
+        // handleTelnetClients();
 
         // Flight log replay logic (DISABLED by default - set REPLAY_ENABLED=true to enable)
         #if REPLAY_ENABLED
@@ -856,7 +888,11 @@ void updateSystemStatus() {
     systemStatus.current_sensor_online = currentSensorInitialized;
     systemStatus.packet_count_lora = loraPacketCount;
     systemStatus.packet_count_433 = radio433PacketCount;
+#ifdef HYBRID_PROTOCOL_MODE
+    systemStatus.pi_connected = false;  // Not tracked in hybrid mode
+#else
     systemStatus.pi_connected = (millis() - commProtocol.getLastActivityTime() < 30000);
+#endif
 }
 
 void printSystemStatus() {
