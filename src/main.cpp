@@ -1,991 +1,762 @@
-/*
- * ESP32 Rocketry Ground Station - Single File Version
- * Complete system in one file for embedded deployment
+/**
+ * @file main.cpp
+ * @brief ESP32 Single-Threaded Firmware with Hybrid Protocol
  *
- * Hardware Requirements:
- * - ESP32 Dev Board
- * - 915MHz LoRa Module (SPI)
- * - 433MHz Radio Module (SPI)
- * - MS5607 Barometer (I2C)
- * - Current Sensor (Analog)
+ * Architecture:
+ * - Priority-based event loop (no FreeRTOS tasks)
+ * - Command queue for Pi requests
+ * - Non-blocking peripheral polling
+ * - Hybrid protocol (binary structure + newline framing)
+ *
+ * Loop Priority:
+ * 1. Read and queue incoming Pi commands (non-blocking)
+ * 2. Execute ONE queued command
+ * 3. Update peripheral sensors on schedule
+ * 4. Send autonomous data if enabled
  */
 
 #include <Arduino.h>
 #include "config.h"
+#include "DataCollector.h"
 
-#ifdef HYBRID_PROTOCOL_MODE
-    // Hybrid protocol standalone mode
-    #include "hybrid_protocol.h"
-#else
-    // Full firmware mode with FreeRTOS
-    #include <WiFi.h>
-
-    #ifndef TEST_MODE
-    // Only include hardware libraries when not in test mode
-    #include <SPI.h>
-    #include <Wire.h>
-    #include <HardwareSerial.h>
-    #include <LoRa.h>
-    #include <RadioLib.h>
-    #include <MS5611.h>
-    #endif
-
-    //brings in config.h and its def also
-    #include "DataCollector.h"
-    #include "CommProtocol.h"
-    #include "PollingManager.h"
-#endif
-
-#ifndef HYBRID_PROTOCOL_MODE
+// Optionally keep FlightDataReplay for testing
 #ifdef TEST_MODE
-#include "FlightDataReplay.h"
-#endif
-#endif
-
-// ====================================================================
-// Debug printing control - disable to prevent ASCII mixing with binary protocol
-// ====================================================================
-#define MAIN_DEBUG_ENABLED false
-#define REPLAY_ENABLED false  // Disable flight data replay
-
-#if MAIN_DEBUG_ENABLED
-    #define MAIN_DEBUG_PRINT(x) Serial.print(x)
-    #define MAIN_DEBUG_PRINTLN(x) Serial.println(x)
-    #define MAIN_DEBUG_PRINTF(...) Serial.printf(__VA_ARGS__)
-#else
-    #define MAIN_DEBUG_PRINT(x)
-    #define MAIN_DEBUG_PRINTLN(x)
-    #define MAIN_DEBUG_PRINTF(...)
+// #include "FlightDataReplay.h"  // Commented out for now, can re-enable later
 #endif
 
 // ====================================================================
-// All pin definitions, constants, and data structures are in config.h
+// PROTOCOL CONSTANTS
 // ====================================================================
+// Note: Peripheral IDs and commands are defined in config.h
 
+// Frame format: <AA55[PID][LEN][PAYLOAD_HEX][CHK]55AA>\n
+#define HYBRID_MAX_FRAME_SIZE 512
+#define HYBRID_MAX_PAYLOAD_SIZE 128
 
-// ====================================================================
-// GLOBAL VARIABLES
-// ====================================================================
+// Frame markers
+#define HYBRID_FRAME_START '<'
+#define HYBRID_FRAME_END '>'
 
+// Response codes
+#define RESP_ACK            0x01
+#define RESP_ERROR          0xFF
 
-DataCollector dataCollector;
-
-#ifndef HYBRID_PROTOCOL_MODE
-CommProtocol commProtocol(&dataCollector, &Serial);
-#endif
-
-#ifdef TEST_MODE
-// WiFi Telnet Server for remote serial monitoring
-// WiFiServer telnetServer(TELNET_PORT);
-// WiFiClient telnetClient;
-
-// Flight log replay state
-bool replayEnabled = false;
-int replayIndex = 0;
-uint32_t lastReplayTime = 0;
-const uint32_t REPLAY_INTERVAL_MS = 1000; // 1 line per second
-#endif
-
-#ifndef TEST_MODE
-// Sensor Hardware Objects (only in normal mode)
-SX1278 radio433Module(new Module(RADIO433_CS_PIN, RADIO433_DIO0_PIN, RADIO433_RST_PIN));
-MS5611 ms5607Sensor;
-HardwareSerial piSerial(2);
-#endif
-
-// Data Buffers
-LoRaPacket_t loraBuffer[LORA_BUFFER_SIZE];
-Radio433Packet_t radio433Buffer[RADIO433_BUFFER_SIZE];
-BarometerData_t latestBarometerData;
-CurrentData_t latestCurrentData;
-
-// Buffer Management
-uint16_t loraBufferHead = 0, loraBufferTail = 0;
-uint16_t radio433BufferHead = 0, radio433BufferTail = 0;
-uint16_t loraPacketCount = 0, radio433PacketCount = 0;
-
-// System Status
-SystemStatus_t systemStatus;
-uint32_t bootTime = 0;
-
-
-// Sensor Status
-bool loraInitialized = false;
-bool radio433Initialized = false;
-bool barometerInitialized = false;
-bool currentSensorInitialized = false;
-
-// Current Sensor Calibration
-float voltageDividerRatio = 11.0;
-float currentSensorSensitivity = 66.0; // mV/A for ACS712-30A
-float voltageOffset = 0.0;
-float currentOffset = 0.0;
-
-// Current Sensor Filtering
-const int CURRENT_SAMPLE_COUNT = 10;
-float voltageSamples[CURRENT_SAMPLE_COUNT];
-float currentSamples[CURRENT_SAMPLE_COUNT];
-int sampleIndex = 0;
-bool samplesFilled = false;
-
-// Task Handles
-TaskHandle_t dataCollectionTaskHandle = nullptr;
-TaskHandle_t communicationTaskHandle = nullptr;
-
-// Mutex for thread safety
-SemaphoreHandle_t loraBufferMutex;
-SemaphoreHandle_t radio433BufferMutex;
-SemaphoreHandle_t barometerDataMutex;
-SemaphoreHandle_t currentDataMutex;
+// Error codes
+#define ERROR_INVALID_FRAME 0x01
+#define ERROR_QUEUE_FULL    0x02
+#define ERROR_INVALID_CMD   0x03
+#define ERROR_INVALID_PID   0x04
 
 // ====================================================================
-// AUTONOMOUS POLLING SYSTEM
+// COMMAND QUEUE
 // ====================================================================
-struct PollConfig {
-    uint8_t peripheral_id;      // Which peripheral to poll
-    uint16_t interval_ms;       // Polling interval in milliseconds
-    uint32_t last_poll_time;    // Last time data was sent (millis)
-    bool active;                // Is this poll entry active?
+
+#define MAX_QUEUE_SIZE 8
+
+struct Command {
+    uint8_t peripheralId;
+    uint8_t command;
+    uint8_t payload[16];
+    uint8_t payloadLen;
 };
 
-#define MAX_POLL_ENTRIES 4  // One per sensor: LORA_915, LORA_433, BAROMETER, CURRENT
-PollConfig pollList[MAX_POLL_ENTRIES];
+class CommandQueue {
+private:
+    Command queue[MAX_QUEUE_SIZE];
+    uint8_t head;
+    uint8_t tail;
+    uint8_t count;
 
-// ====================================================================
-// FORWARD DECLARATIONS
-// ====================================================================
+public:
+    CommandQueue() : head(0), tail(0), count(0) {}
 
-void setupSerial();
-void setupSPI();
-void setupI2C();
-void initializeLoRa();
-void initializeRadio433();
-void initializeBarometer();
-void initializeCurrentSensor();
-
-
-
-
-void dataCollectionTask(void* parameters);
-void communicationTask(void* parameters);
-void mainLoopTask(void* parameters);
-
-void checkLoRaPackets();
-void checkRadio433Packets();
-void updateBarometer();
-void updateCurrentSensor();
-
-// Polling system functions
-void initPollList();
-void addToPollList(uint8_t peripheral_id, uint16_t interval_ms);
-void removeFromPollList(uint8_t peripheral_id);
-void checkAndSendPollingData();
-
-void addLoRaPacket(const LoRaPacket_t& packet);
-void addRadio433Packet(const Radio433Packet_t& packet);
-
-void handleSerialCommands();
-void printWelcomeMessage();
-void printSystemStatus();
-void updateSystemStatus();
-
-#ifdef TEST_MODE
-// WiFi Telnet handling
-// void handleTelnetClients() {
-//     // Check for new clients
-//     if (telnetServer.hasClient()) {
-//         // Disconnect old client if exists
-//         if (telnetClient && telnetClient.connected()) {
-//             telnetClient.stop();
-//         }
-//         telnetClient = telnetServer.available();
-//         MAIN_DEBUG_PRINTLN("\n[WiFi] Telnet client connected!");
-//         telnetClient.println("=== ESP32 Remote Serial Monitor ===");
-//         telnetClient.printf("Connected to: %s\n", WiFi.localIP().toString().c_str());
-//         telnetClient.println("===================================\n");
-//     }
-// }
-
-// Callback function when WAKEUP command is received
-void onWakeupReceived() {
-    #if REPLAY_ENABLED
-    MAIN_DEBUG_PRINTLN("[REPLAY] WAKEUP received - starting flight log replay!");
-    replayEnabled = true;
-    replayIndex = 0;
-    lastReplayTime = millis();
-    #endif
-}
-
-// Function to send one flight log line as a LoRa packet
-void sendFlightLogLine(const char* line) {
-    // Create a fake LoRa packet from the flight log line
-    WireLoRa_t packet{};
-    packet.version = 1;
-    packet.packet_count = replayIndex;
-
-    // Parse RSSI and SNR from the line if present
-    // Format: "RSSI:-82, SNR:12 | [...]"
-    if (strncmp(line, "RSSI:", 5) == 0) {
-        packet.rssi_dbm = atoi(line + 5);
-        const char* snr_pos = strstr(line, "SNR:");
-        if (snr_pos) {
-            packet.snr_db = atof(snr_pos + 4);
+    bool enqueue(const Command& cmd) {
+        if (count >= MAX_QUEUE_SIZE) {
+            return false;
         }
-    } else {
-        packet.rssi_dbm = -85;
-        packet.snr_db = 3.5;
+        queue[head] = cmd;
+        head = (head + 1) % MAX_QUEUE_SIZE;
+        count++;
+        return true;
     }
 
-    // Copy the entire line as packet data (truncate if needed)
-    size_t line_len = strlen(line);
-    packet.latest_len = (line_len > 64) ? 64 : line_len;
-    memcpy(packet.latest_data, line, packet.latest_len);
+    bool dequeue(Command* cmd) {
+        if (count == 0) {
+            return false;
+        }
+        *cmd = queue[tail];
+        tail = (tail + 1) % MAX_QUEUE_SIZE;
+        count--;
+        return true;
+    }
 
-    // Send as binary-framed LoRa packet
-    Serial.write((uint8_t)HELLO_BYTE);
-    Serial.write((uint8_t)PERIPHERAL_ID_LORA_915);
-    Serial.write((uint8_t)sizeof(WireLoRa_t));
-    Serial.write((uint8_t*)&packet, sizeof(WireLoRa_t));
-    Serial.write((uint8_t)GOODBYE_BYTE);
-    Serial.flush();
-
-    // Also print to debug
-    MAIN_DEBUG_PRINTF("[REPLAY] Sent line %d: %.50s%s\n",
-                  replayIndex,
-                  line,
-                  (line_len > 50) ? "..." : "");
-}
-
-// Override Serial.print functions to also send to telnet
-// class TelnetSerial : public Print {
-// public:
-//     size_t write(uint8_t c) override {
-//         size_t n = Serial.write(c);
-//         if (telnetClient && telnetClient.connected()) {
-//             telnetClient.write(c);
-//         }
-//         return n;
-//     }
-
-//     size_t write(const uint8_t *buffer, size_t size) override {
-//         size_t n = Serial.write(buffer, size);
-//         if (telnetClient && telnetClient.connected()) {
-//             telnetClient.write(buffer, size);
-//         }
-//         return n;
-//     }
-// };
-#endif
+    bool isEmpty() const { return count == 0; }
+    bool isFull() const { return count >= MAX_QUEUE_SIZE; }
+    uint8_t size() const { return count; }
+};
 
 // ====================================================================
-// SETUP FUNCTION
+// PERIPHERAL POLLING SCHEDULE
+// ====================================================================
+
+struct PeripheralPoller {
+    uint8_t peripheralId;
+    uint32_t lastPollTime;        // Last time sensor was polled
+    uint32_t lastSendTime;        // Last time data was sent (for autonomous)
+    uint32_t pollInterval;        // milliseconds
+    bool enabled;
+    bool autonomousSendEnabled;   // Send data automatically
+};
+
+#define MAX_POLLERS 5
+
+PeripheralPoller pollers[MAX_POLLERS] = {
+    {PERIPHERAL_ID_LORA_915,  0, 0, 100,  true, false},  // LoRa 915MHz: poll every 100ms
+    {PERIPHERAL_ID_RADIO_433, 0, 0, 100,  true, false},  // 433MHz: poll every 100ms
+    {PERIPHERAL_ID_BAROMETER, 0, 0, 500,  true, false},  // Barometer: poll every 500ms
+    {PERIPHERAL_ID_CURRENT,   0, 0, 1000, true, false},  // Current: poll every 1000ms
+    {PERIPHERAL_ID_SYSTEM,    0, 0, 5000, true, false}   // System: poll every 5000ms
+};
+
+// Special poller for PID_ALL (sends all peripheral data)
+PeripheralPoller allPeripheralsPoller = {PERIPHERAL_ID_ALL, 0, 0, 1000, false, false};
+
+// ====================================================================
+// GLOBAL INSTANCES
+// ====================================================================
+
+DataCollector dataCollector;
+CommandQueue commandQueue;
+
+// ====================================================================
+// LOOP PERFORMANCE TRACKING
+// ====================================================================
+
+struct LoopStats {
+    uint32_t loopCount;
+    uint32_t lastReportTime;
+    uint32_t lastLoopTime;
+    float loopsPerSecond;
+    float avgLoopTimeMs;
+};
+
+LoopStats loopStats = {0, 0, 0, 0.0f, 0.0f};
+
+// Serial receive buffer (static for state machine)
+static char rxFrameBuffer[HYBRID_MAX_FRAME_SIZE];
+static size_t rxFrameIndex = 0;
+static uint32_t rxFrameStartTime = 0;
+
+// Activity tracking
+uint32_t lastActivityTime = 0;
+uint32_t bootTime = 0;
+
+// Statistics
+uint32_t totalCommandsReceived = 0;
+uint32_t totalCommandsExecuted = 0;
+uint32_t totalFrameErrors = 0;
+
+// ====================================================================
+// FUNCTION PROTOTYPES
+// ====================================================================
+
+// Main loop functions
+void readIncomingCommands();
+void executeQueuedCommand();
+void updatePeripherals();
+void sendAutonomousData();
+
+// Protocol functions
+uint8_t calculateChecksum(uint8_t pid, uint8_t len, const uint8_t* payload);
+void sendHybridFrame(uint8_t pid, const uint8_t* payload, size_t len);
+bool parseHybridFrame(const char* frame, uint8_t* pid, uint8_t* cmd, uint8_t* payload, uint8_t* payloadLen);
+
+// Command handlers
+void handleCommand(const Command& cmd);
+void handleGetAllPeripherals();
+void sendPeripheralData(uint8_t pid);
+void sendAckResponse(uint8_t pid);
+void sendErrorResponse(uint8_t pid, uint8_t errorCode);
+void sendSystemStatus();
+
+// Polling control
+void enablePolling(uint8_t pid, uint16_t interval);
+void disablePolling(uint8_t pid);
+void enableAutonomousSend(uint8_t pid, uint16_t interval);
+void disableAutonomousSend(uint8_t pid);
+PeripheralPoller* findPoller(uint8_t pid);
+
+// ====================================================================
+// SETUP
 // ====================================================================
 
 void setup() {
-#ifdef HYBRID_PROTOCOL_MODE
-    // HYBRID PROTOCOL MODE: Run standalone test mode (NO FreeRTOS)
-    runHybridProtocolMode();
-    // Never returns - hybrid protocol runs in its own loop
-#else
-    // FULL FIRMWARE MODE: Initialize everything and start FreeRTOS tasks
-    // Initialize serial communication
-    setupSerial();
-    printWelcomeMessage();
+    // Initialize serial
+    Serial.begin(115200);
+    Serial.setRxBufferSize(1024);
+    while (!Serial && millis() < 3000) delay(10);
+    delay(500);
 
-#ifdef TEST_MODE
-    // TEST MODE: Initialize WiFi for remote monitoring
-    Serial.println("\nConnecting to WiFi...");
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    // Print banner
+    Serial.println("\n====================================");
+    Serial.println("  ESP32 HYBRID PROTOCOL MODE");
+    Serial.println("  Single-Threaded Event Loop");
+    Serial.println("====================================");
+    Serial.println();
+    Serial.println("Format: <AA55[PID][LEN][PAYLOAD_HEX][CHK]55AA>\\n");
+    Serial.println();
 
-    int wifi_timeout = 0;
-    while (WiFi.status() != WL_CONNECTED && wifi_timeout < 20) {
-        delay(500);
-        Serial.print(".");
-        wifi_timeout++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\nWiFi Connected!");
-        Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
-        Serial.printf("Telnet server on port %d\n", TELNET_PORT);
-        Serial.println("Connect with: telnet <ip> 23");
-        telnetServer.begin();
-        telnetServer.setNoDelay(true);
-    } else {
-        Serial.println("\nWiFi connection failed - continuing without remote monitoring");
-    }
-
-    // TEST MODE: Initialize DataCollector with fake sensors
+    // Initialize data collector (sensors)
     dataCollector.begin();
 
-    // Initialize polling system
-    initPollList();
-#else
-    // NORMAL MODE: Initialize communication buses
-    setupSPI();
-    setupI2C();
-
-    // Create mutexes for thread safety
-    loraBufferMutex = xSemaphoreCreateMutex();
-    radio433BufferMutex = xSemaphoreCreateMutex();
-    barometerDataMutex = xSemaphoreCreateMutex();
-    currentDataMutex = xSemaphoreCreateMutex();
-
-    // Initialize all sensors
-    initializeLoRa();
-    initializeRadio433();
-    initializeBarometer();
-    initializeCurrentSensor();
-
-    // Initialize DataCollector with real sensors
-    dataCollector.begin();
-
-    // Initialize polling system
-    initPollList();
-#endif
-
-    // Initialize communication protocol
-#ifndef HYBRID_PROTOCOL_MODE
-    commProtocol.begin();
-#endif
-
-    // Initialize system status
+    // Record boot time
     bootTime = millis();
-    updateSystemStatus();
+    lastActivityTime = millis();
 
-    printSystemStatus();
-
-    // Create FreeRTOS tasks
-    xTaskCreate(dataCollectionTask, "DataCollection", 4096, nullptr, 2, &dataCollectionTaskHandle);
-    xTaskCreate(communicationTask, "Communication", 4096, nullptr, 3, &communicationTaskHandle);
-    xTaskCreate(mainLoopTask, "MainLoop", 4096, nullptr, 1, nullptr);
-
-    Serial.println("Setup complete - ESP32 Ground Station is running");
-#ifdef TEST_MODE
-    Serial.println("TEST MODE: Waiting for binary commands on Serial...");
-    Serial.println("TEST MODE: Flight log replay ready - send WAKEUP command to start");
-
-    // Register wakeup callback for flight log replay
-#ifndef HYBRID_PROTOCOL_MODE
-    commProtocol.setWakeupCallback(onWakeupReceived);
-#endif
-#else
-    Serial.println("Type 'help' for available commands");
-#endif
-#endif // HYBRID_PROTOCOL_MODE
+    Serial.println("Ready for commands!\n");
 }
 
 // ====================================================================
-// POLLING SYSTEM HELPER FUNCTIONS
-// ====================================================================
-
-void initPollList() {
-    for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
-        pollList[i].peripheral_id = 0;
-        pollList[i].interval_ms = 0;
-        pollList[i].last_poll_time = 0;
-        pollList[i].active = false;
-    }
-}
-
-void addToPollList(uint8_t peripheral_id, uint16_t interval_ms) {
-    // First check if this peripheral already exists in the list
-    for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
-        if (pollList[i].active && pollList[i].peripheral_id == peripheral_id) {
-            // Update existing entry
-            pollList[i].interval_ms = interval_ms;
-            pollList[i].last_poll_time = millis();
-            return;
-        }
-    }
-
-    // Not found, add new entry
-    for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
-        if (!pollList[i].active) {
-            pollList[i].peripheral_id = peripheral_id;
-            pollList[i].interval_ms = interval_ms;
-            pollList[i].last_poll_time = millis();
-            pollList[i].active = true;
-            return;
-        }
-    }
-
-    // Poll list is full - this shouldn't happen with only 4 sensors
-    Serial.println("ERROR: Poll list full!");
-}
-
-void removeFromPollList(uint8_t peripheral_id) {
-    for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
-        if (pollList[i].active && pollList[i].peripheral_id == peripheral_id) {
-            pollList[i].active = false;
-            return;
-        }
-    }
-}
-
-void checkAndSendPollingData() {
-#ifndef HYBRID_PROTOCOL_MODE
-    // ONLY poll if state machine is idle (not processing a command)
-    if (commProtocol.getState() != WAIT_FOR_HELLO) {
-        return;  // Busy processing command, skip this poll cycle
-    }
-#endif
-
-    uint32_t now = millis();
-
-    // Check if all active entries have the same interval (poll all case)
-    bool all_same_interval = false;
-    uint16_t common_interval = 0;
-    int active_count = 0;
-
-    for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
-        if (pollList[i].active) {
-            if (active_count == 0) {
-                common_interval = pollList[i].interval_ms;
-            } else if (pollList[i].interval_ms != common_interval) {
-                common_interval = 0;  // Different intervals
-                break;
-            }
-            active_count++;
-        }
-    }
-
-    all_same_interval = (active_count > 1 && common_interval > 0);
-
-    if (all_same_interval) {
-        // Poll all sensors together with 50ms spacing between each
-        // Use the first entry's timer to control the whole group
-        int first_active = -1;
-        for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
-            if (pollList[i].active) {
-                first_active = i;
-                break;
-            }
-        }
-
-        if (first_active >= 0 && (now - pollList[first_active].last_poll_time >= common_interval)) {
-            // Send all peripherals with 50ms spacing (gives Pi time to process each message)
-            for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
-                if (pollList[i].active) {
-#ifndef HYBRID_PROTOCOL_MODE
-                    commProtocol.sendPeripheralData(pollList[i].peripheral_id);
-#endif
-                    if (i < MAX_POLL_ENTRIES - 1) {  // Don't delay after last one
-                        delay(50);
-                    }
-                }
-            }
-            // Update all timers
-            for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
-                if (pollList[i].active) {
-                    pollList[i].last_poll_time = now;
-                }
-            }
-        }
-    } else {
-        // Individual polling - each peripheral on its own schedule
-        // Track last send time globally to ensure minimum 50ms spacing between ANY messages
-        static uint32_t last_global_send_time = 0;
-
-        for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
-            if (pollList[i].active) {
-                // Check if it's time to poll this peripheral
-                if (now - pollList[i].last_poll_time >= pollList[i].interval_ms) {
-                    // Ensure minimum 50ms spacing since last message (prevents Pi RX buffer overflow)
-                    uint32_t time_since_last_send = millis() - last_global_send_time;
-                    if (last_global_send_time > 0 && time_since_last_send < 50) {
-                        delay(50 - time_since_last_send);
-                    }
-
-#ifndef HYBRID_PROTOCOL_MODE
-                    commProtocol.sendPeripheralData(pollList[i].peripheral_id);
-#endif
-                    pollList[i].last_poll_time = millis();
-                    last_global_send_time = millis();
-                }
-            }
-        }
-    }
-}
-
-// ====================================================================
-// MAIN LOOP
+// MAIN EVENT LOOP
 // ====================================================================
 
 void loop() {
-    // DISABLED: handleSerialCommands() interferes with binary protocol
-    // The binary protocol (CommProtocol) handles all serial communication
-    // If you need debug commands, use a separate serial port or re-enable in non-protocol mode
-    // handleSerialCommands();
-    delay(100);
+    uint32_t loopStartTime = micros();  // Track loop start for performance metrics
+
+    // PRIORITY 1: Read and queue incoming Pi commands (non-blocking)
+    readIncomingCommands();
+
+    // PRIORITY 2: Execute ONE queued command (send response)
+    executeQueuedCommand();
+
+    // PRIORITY 3: Update peripheral sensors on schedule
+    updatePeripherals();
+
+    // PRIORITY 4: Send autonomous data if enabled
+    sendAutonomousData();
+
+    // PRIORITY 5: Report loop performance stats (twice per second) - DISABLED FOR NOW
+    // loopStats.loopCount++;
+    // uint32_t now = millis();
+    // if (now - loopStats.lastReportTime >= 500) {  // Report every 500ms (2x per second)
+    //     uint32_t elapsed = now - loopStats.lastReportTime;
+    //     loopStats.loopsPerSecond = (loopStats.loopCount * 1000.0f) / elapsed;
+    //     loopStats.avgLoopTimeMs = elapsed / (float)loopStats.loopCount;
+
+    //     // Send performance stats as a special message
+    //     Serial.printf("[PERF] %.1f loops/sec, %.3f ms/loop, Queue: %d/8\n",
+    //         loopStats.loopsPerSecond, loopStats.avgLoopTimeMs, commandQueue.size());
+
+    //     loopStats.loopCount = 0;
+    //     loopStats.lastReportTime = now;
+    // }
+
+    // Very small delay to prevent watchdog issues but maximize responsiveness
+    // Note: No delay for maximum speed - ESP32 yield() is called automatically
+    yield();  // Let ESP32 handle background tasks (WiFi, etc.)
 }
 
 // ====================================================================
-// INITIALIZATION FUNCTIONS
+// PRIORITY 1: READ INCOMING COMMANDS (NON-BLOCKING)
 // ====================================================================
 
-void setupSerial() {
-    Serial.begin(115200);
-    // For ESP32-S3: add timeout to prevent hanging if Serial is not ready
-    unsigned long start = millis();
-    while (!Serial && (millis() - start < 3000)) delay(10); //wait max 3 seconds for USB serial
-    delay(500);
-    Serial.println();
-    Serial.println("[DEBUG] Serial initialized!");
-}
-
-#ifndef TEST_MODE
-// All sensor initialization functions only in normal mode
-
-void setupSPI() {
-    SPI.begin(SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN);
-    Serial.println("SPI initialized");
-}
-
-void setupI2C() {
-    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-    Serial.println("I2C initialized");
-}
-
-void initializeLoRa() {
-    LoRa.setPins(LORA_CS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
-
-    if (!LoRa.begin(LORA_FREQUENCY)) {
-        Serial.println("LoRa 915MHz: Failed to initialize");
-        loraInitialized = false;
+void readIncomingCommands() {
+    // Exit immediately if no data available
+    if (!Serial.available()) {
         return;
     }
 
-    LoRa.setSignalBandwidth(LORA_BANDWIDTH);
-    LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
-    LoRa.setCodingRate4(LORA_CODING_RATE);
-    LoRa.setTxPower(LORA_TX_POWER);
-    LoRa.enableCrc();
-
-    loraInitialized = true;
-    Serial.println("LoRa 915MHz: Initialized successfully");
-}
-
-void initializeRadio433() {
-    int state = radio433Module.begin(RADIO433_FREQUENCY, RADIO433_BITRATE,
-                                    RADIO433_FREQ_DEV, 125.0, 10, 32);
-
-    if (state != RADIOLIB_ERR_NONE) {
-        Serial.printf("Radio433: Failed to initialize (error: %d)\n", state);
-        radio433Initialized = false;
-        return;
+    // Start timeout tracking for new frame
+    if (rxFrameIndex == 0) {
+        rxFrameStartTime = millis();
     }
 
-    radio433Module.setEncoding(RADIOLIB_ENCODING_NRZ);
-    radio433Module.setCRC(true);
-    radio433Module.startReceive();
+    // Read available characters (non-blocking)
+    while (Serial.available() && rxFrameIndex < HYBRID_MAX_FRAME_SIZE - 1) {
+        char c = Serial.read();
 
-    radio433Initialized = true;
-    Serial.println("Radio433: Initialized successfully");
-}
+        if (c == '\n' || c == '\r') {
+            // Complete frame received!
+            if (rxFrameIndex > 0) {
+                rxFrameBuffer[rxFrameIndex] = '\0';
 
-void initializeBarometer() {
-    // Initialize MS5607 (compatible with MS5611 library)
-    if (!ms5607Sensor.begin()) {
-        Serial.println("Barometer: MS5607 begin failed");
-        barometerInitialized = false;
-        return;
-    }
+                // Parse and queue command
+                uint8_t pid, cmd;
+                uint8_t payload[HYBRID_MAX_PAYLOAD_SIZE];
+                uint8_t payloadLen;
 
-    // Reset and read PROM
-    if (!ms5607Sensor.reset()) {
-        Serial.println("Barometer: MS5607 reset/PROM read failed");
-        barometerInitialized = false;
-        return;
-    }
+                if (parseHybridFrame(rxFrameBuffer, &pid, &cmd, payload, &payloadLen)) {
+                    // Valid frame - create command
+                    Command newCmd;
+                    newCmd.peripheralId = pid;
+                    newCmd.command = cmd;
+                    newCmd.payloadLen = min(payloadLen, (uint8_t)sizeof(newCmd.payload));
+                    memcpy(newCmd.payload, payload, newCmd.payloadLen);
 
-    // Set high oversampling for better precision
-    ms5607Sensor.setOversampling(OSR_ULTRA_HIGH);
-
-    barometerInitialized = true;
-    Serial.println("Barometer: MS5607 initialized successfully");
-}
-
-void initializeCurrentSensor() {
-    analogReadResolution(12);
-    analogSetAttenuation(ADC_11db);
-
-    // Initialize sample arrays
-    memset(voltageSamples, 0, sizeof(voltageSamples));
-    memset(currentSamples, 0, sizeof(currentSamples));
-
-    currentSensorInitialized = true;
-    Serial.println("CurrentSensor: Initialized successfully");
-}
-#endif // TEST_MODE
-
-
-
-// ====================================================================
-// FREERTOS TASKS
-// ====================================================================
-
-void dataCollectionTask(void* parameters) {
-    while (true) {
-#ifndef TEST_MODE
-        // Only poll sensors in normal mode
-        if (loraInitialized) {
-            checkLoRaPackets();
-        }
-
-        if (radio433Initialized) {
-            checkRadio433Packets();
-        }
-
-        if (barometerInitialized) {
-            updateBarometer();
-        }
-
-        if (currentSensorInitialized) {
-            updateCurrentSensor();
-        }
-#endif
-
-        static uint32_t lastStatusUpdate = 0;
-        if (millis() - lastStatusUpdate > 5000) {
-            updateSystemStatus();
-            lastStatusUpdate = millis();
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_READ_INTERVAL));
-    }
-}
-
-void communicationTask(void* parameters) {
-    static uint32_t lastHeartbeat = 0;
-
-    while (true) {
-        // Process incoming commands
-#ifndef HYBRID_PROTOCOL_MODE
-        commProtocol.process();
-#endif
-
-        // Check and send autonomous polling data (state-aware)
-        checkAndSendPollingData();
-
-#ifdef TEST_MODE
-        // Handle WiFi telnet clients
-        // handleTelnetClients();
-
-        // Flight log replay logic (DISABLED by default - set REPLAY_ENABLED=true to enable)
-        #if REPLAY_ENABLED
-        if (replayEnabled) {
-            uint32_t currentTime = millis();
-            if (currentTime - lastReplayTime >= REPLAY_INTERVAL_MS) {
-                // Send the current line
-                sendFlightLogLine(flightLogLines[replayIndex]);
-
-                // Move to next line (loop back to start if at end)
-                replayIndex++;
-                if (replayIndex >= flightLogLineCount) {
-                    replayIndex = 0;
-                    MAIN_DEBUG_PRINTLN("[REPLAY] Loop complete - restarting from beginning");
+                    // Queue it (don't execute yet!)
+                    if (commandQueue.enqueue(newCmd)) {
+                        totalCommandsReceived++;
+                        lastActivityTime = millis();
+                    } else {
+                        // Queue full - send error immediately
+                        sendErrorResponse(pid, ERROR_QUEUE_FULL);
+                    }
+                } else {
+                    // Invalid frame
+                    totalFrameErrors++;
+                    // Could send error response here if we could parse PID
                 }
 
-                lastReplayTime = currentTime;
+                rxFrameIndex = 0;
             }
-        }
-        #endif
-
-        // Send binary status update every second (only when NOT replaying, to avoid spam)
-        // TEMPORARILY DISABLED
-        // if (!replayEnabled && (millis() - lastHeartbeat > 1000)) {
-        //     commProtocol.sendStatusUpdate();
-        //     lastHeartbeat = millis();
-        // }
-#else
-        // NORMAL MODE: Send periodic status update every 5 seconds
-        // This acts as a heartbeat to show the ESP32 is still running
-        // TEMPORARILY DISABLED
-        // if (millis() - lastHeartbeat > 5000) {
-        //     commProtocol.sendStatusUpdate();
-        //     lastHeartbeat = millis();
-        // }
-#endif
-
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
-
-void mainLoopTask(void* parameters) {
-    uint32_t lastStatusPrint = 0;
-
-    while (true) {
-        // TEMPORARILY DISABLED - automatic status printing
-        // if (millis() - lastStatusPrint > 30000) {
-        //     Serial.println("\n--- System Status Update ---");
-        //     printSystemStatus();
-        //     Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
-        //     Serial.println("---------------------------\n");
-        //     lastStatusPrint = millis();
-        // }
-
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-}
-
-// ====================================================================
-// SENSOR DATA COLLECTION
-// ====================================================================
-
-#ifndef TEST_MODE
-// Sensor reading functions only in normal mode
-
-void checkLoRaPackets() {
-    int packetSize = LoRa.parsePacket();
-    if (packetSize > 0) {
-        LoRaPacket_t newPacket;
-        newPacket.timestamp = millis();
-        newPacket.rssi = LoRa.packetRssi();
-        newPacket.snr = LoRa.packetSnr();
-        newPacket.data_length = min(packetSize, MAX_PACKET_SIZE);
-        
-        for (int i = 0; i < newPacket.data_length; i++) {
-            newPacket.data[i] = LoRa.read();
-        }
-        
-        addLoRaPacket(newPacket);
-        loraPacketCount++;
-
-        Serial.printf("LoRa RX: %d bytes, RSSI: %d dBm, SNR: %.2f dB\n",
-                      newPacket.data_length, newPacket.rssi, newPacket.snr);
-    }
-}
-
-void checkRadio433Packets() {
-    String receivedData;
-    int state = radio433Module.readData(receivedData);
-    
-    if (state == RADIOLIB_ERR_NONE) {
-        Radio433Packet_t newPacket;
-        newPacket.timestamp = millis();
-        newPacket.rssi = radio433Module.getRSSI();
-        newPacket.data_length = min((int)receivedData.length(), MAX_PACKET_SIZE);
-        
-        memcpy(newPacket.data, receivedData.c_str(), newPacket.data_length);
-        
-        addRadio433Packet(newPacket);
-        radio433PacketCount++;
-        
-        Serial.printf("433MHz RX: %d bytes, RSSI: %d dBm\n", 
-                      newPacket.data_length, newPacket.rssi);
-        
-        radio433Module.startReceive();
-    }
-    else if (state == RADIOLIB_ERR_RX_TIMEOUT) {
-        radio433Module.startReceive();
-    }
-}
-
-void updateBarometer() {
-    if (!barometerInitialized) return;
-
-    if (xSemaphoreTake(barometerDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        latestBarometerData.timestamp = millis();
-
-        // Read temperature and pressure
-        int result = ms5607Sensor.read();
-        if (result == MS5611_READ_OK) {
-            latestBarometerData.temperature_c = (float)ms5607Sensor.getTemperature();
-            latestBarometerData.pressure_hpa = (float)ms5607Sensor.getPressure();
-
-            // Calculate altitude (using standard sea level pressure)
-            float ratio = latestBarometerData.pressure_hpa / 1013.25f;
-            latestBarometerData.altitude_m = 44330.0f * (1.0f - powf(ratio, 0.19029495f));
-        } else {
-            Serial.printf("Barometer: Read failed with code %d\n", result);
+            return;
         }
 
-        xSemaphoreGive(barometerDataMutex);
+        rxFrameBuffer[rxFrameIndex++] = c;
     }
-}
 
-void updateCurrentSensor() {
-    int rawADC = analogRead(CURRENT_SENSOR_PIN);
-    float adcVoltage = (rawADC * 3.3) / 4095.0;
-    float actualVoltage = (adcVoltage * voltageDividerRatio) + voltageOffset;
-    float currentA = ((adcVoltage - 2.5) * 1000.0 / currentSensorSensitivity) + currentOffset;
-    
-    // Add to sample arrays
-    voltageSamples[sampleIndex] = actualVoltage;
-    currentSamples[sampleIndex] = currentA;
-    sampleIndex = (sampleIndex + 1) % CURRENT_SAMPLE_COUNT;
-    
-    if (sampleIndex == 0) samplesFilled = true;
-    
-    // Calculate filtered values
-    float voltageSum = 0, currentSum = 0;
-    int count = samplesFilled ? CURRENT_SAMPLE_COUNT : sampleIndex;
-    
-    for (int i = 0; i < count; i++) {
-        voltageSum += voltageSamples[i];
-        currentSum += currentSamples[i];
-    }
-    
-    if (xSemaphoreTake(currentDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        latestCurrentData.timestamp = millis();
-        latestCurrentData.voltage_v = voltageSum / count;
-        latestCurrentData.current_a = currentSum / count;
-        latestCurrentData.power_w = latestCurrentData.voltage_v * latestCurrentData.current_a;
-        
-        xSemaphoreGive(currentDataMutex);
+    // Timeout check - abandon partial frame after 1 second
+    if (rxFrameIndex > 0 && millis() - rxFrameStartTime > 1000) {
+        rxFrameIndex = 0;
     }
 }
 
 // ====================================================================
-// BUFFER MANAGEMENT
+// PRIORITY 2: EXECUTE ONE QUEUED COMMAND
 // ====================================================================
 
-void addLoRaPacket(const LoRaPacket_t& packet) {
-    if (xSemaphoreTake(loraBufferMutex, portMAX_DELAY) == pdTRUE) {
-        loraBuffer[loraBufferHead] = packet;
-        loraBufferHead = (loraBufferHead + 1) % LORA_BUFFER_SIZE;
-        
-        if (loraBufferHead == loraBufferTail) {
-            loraBufferTail = (loraBufferTail + 1) % LORA_BUFFER_SIZE;
-        }
-        
-        xSemaphoreGive(loraBufferMutex);
-    }
-}
+void executeQueuedCommand() {
+    // Execute up to 3 commands per loop iteration if queue is getting full
+    // This prevents queue overflow during burst requests
+    uint8_t maxExecutions = commandQueue.size() > 5 ? 3 : 1;
 
-void addRadio433Packet(const Radio433Packet_t& packet) {
-    if (xSemaphoreTake(radio433BufferMutex, portMAX_DELAY) == pdTRUE) {
-        radio433Buffer[radio433BufferHead] = packet;
-        radio433BufferHead = (radio433BufferHead + 1) % RADIO433_BUFFER_SIZE;
+    for (uint8_t i = 0; i < maxExecutions; i++) {
+        Command cmd;
 
-        if (radio433BufferHead == radio433BufferTail) {
-            radio433BufferTail = (radio433BufferTail + 1) % RADIO433_BUFFER_SIZE;
+        // Dequeue one command
+        if (!commandQueue.dequeue(&cmd)) {
+            return;  // No more commands pending
         }
 
-        xSemaphoreGive(radio433BufferMutex);
+        // Execute it
+        handleCommand(cmd);
+        totalCommandsExecuted++;
     }
 }
-#endif // TEST_MODE
 
-// ====================================================================
-// COMMUNICATION PROTOCOL
-// ====================================================================
-
-// All communication protocol handling is now in CommProtocol.cpp
-// Binary data transmission only - no JSON
-
-// ====================================================================
-// UTILITY FUNCTIONS
-// ====================================================================
-
-void updateSystemStatus() {
-    systemStatus.uptime_seconds = (millis() - bootTime) / 1000;
-    systemStatus.lora_online = loraInitialized;
-    systemStatus.radio433_online = radio433Initialized;
-    systemStatus.barometer_online = barometerInitialized;
-    systemStatus.current_sensor_online = currentSensorInitialized;
-    systemStatus.packet_count_lora = loraPacketCount;
-    systemStatus.packet_count_433 = radio433PacketCount;
-#ifdef HYBRID_PROTOCOL_MODE
-    systemStatus.pi_connected = false;  // Not tracked in hybrid mode
-#else
-    systemStatus.pi_connected = (millis() - commProtocol.getLastActivityTime() < 30000);
-#endif
-}
-
-void printSystemStatus() {
-    Serial.println("=== System Status ===");
-    Serial.printf("Uptime: %d seconds\n", systemStatus.uptime_seconds);
-    Serial.printf("LoRa: %s (%d packets)\n", systemStatus.lora_online ? "Online" : "Offline", systemStatus.packet_count_lora);
-    Serial.printf("433MHz: %s (%d packets)\n", systemStatus.radio433_online ? "Online" : "Offline", systemStatus.packet_count_433);
-    Serial.printf("Barometer: %s\n", systemStatus.barometer_online ? "Online" : "Offline");
-    Serial.printf("Current Sensor: %s\n", systemStatus.current_sensor_online ? "Online" : "Offline");
-    Serial.printf("Pi Connected: %s\n", systemStatus.pi_connected ? "Yes" : "No");
-    Serial.println("====================");
-}
-
-void printWelcomeMessage() {
-    Serial.println("======================================");
-    Serial.println("    ESP32 Rocketry Ground Station");
-#ifdef TEST_MODE
-    Serial.println("      **TEST MODE ENABLED**");
-    Serial.println("      No Hardware Required");
-#else
-    Serial.println("       Single File Version 1.0");
-#endif
-    Serial.println("======================================");
-    Serial.printf("ESP32 Chip Rev: %d\n", ESP.getChipRevision());
-    Serial.printf("Free Heap: %d bytes\n", ESP.getFreeHeap());
-#ifdef TEST_MODE
-    Serial.println("\nTEST MODE: All sensors simulated");
-    Serial.println("Ready for Pi protocol testing");
-    Serial.println("Waiting for commands on USB Serial...");
-#endif
-    Serial.println("======================================");
-}
-
-void handleSerialCommands() {
-    if (Serial.available()) {
-        String command = Serial.readStringUntil('\n');
-        command.trim();
-        command.toLowerCase();
-        
-        if (command == "help") {
-            Serial.println("\n=== Available Commands ===");
-            Serial.println("help     - Show this help");
-            Serial.println("status   - Show system status");
-            Serial.println("lora     - Show LoRa info");
-            Serial.println("433      - Show 433MHz info");
-            Serial.println("baro     - Show barometer");
-            Serial.println("current  - Show current sensor");
-            Serial.println("reboot   - Restart system");
-            Serial.println("==========================\n");
-        }
-        else if (command == "status") {
-            printSystemStatus();
-        }
-        else if (command == "lora") {
-            Serial.printf("LoRa Status: %s\n", loraInitialized ? "Online" : "Offline");
-#ifndef TEST_MODE
-            if (loraInitialized) {
-                Serial.printf("Packets: %d, RSSI: %d dBm\n", loraPacketCount, LoRa.rssi());
+void handleCommand(const Command& cmd) {
+    switch (cmd.command) {
+        case CMD_GET_ALL:
+            // Check if this is a request for ALL peripherals
+            if (cmd.peripheralId == PERIPHERAL_ID_ALL) {
+                handleGetAllPeripherals();
+            } else {
+                // Send single peripheral data
+                sendPeripheralData(cmd.peripheralId);
             }
-#else
-            Serial.printf("Packets: %d (simulated)\n", loraPacketCount);
-#endif
-        }
-        else if (command == "433") {
-            Serial.printf("433MHz Status: %s\n", radio433Initialized ? "Online" : "Offline");
-#ifndef TEST_MODE
-            if (radio433Initialized) {
-                Serial.printf("Packets: %d, RSSI: %d dBm\n", radio433PacketCount, radio433Module.getRSSI());
+            break;
+
+        case CMD_GET_STATUS:
+            // Get status/health of this peripheral
+            if (cmd.peripheralId == PERIPHERAL_ID_SYSTEM) {
+                sendSystemStatus();
+            } else {
+                sendPeripheralData(cmd.peripheralId);
             }
-#else
-            Serial.printf("Packets: %d (simulated)\n", radio433PacketCount);
-#endif
-        }
-        else if (command == "baro") {
-            Serial.printf("Barometer Status: %s\n", barometerInitialized ? "Online" : "Offline");
-            if (barometerInitialized) {
-                Serial.printf("Pressure: %.2f hPa, Temp: %.2f°C\n", 
-                             latestBarometerData.pressure_hpa, latestBarometerData.temperature_c);
+            break;
+
+        case CMD_SET_POLL_RATE:
+            // Enable autonomous polling and sending
+            // Note: payload[0] is the command byte, actual data starts at payload[1]
+            if (cmd.payloadLen >= 3) {  // Need command + 2 bytes for interval
+                uint16_t interval = cmd.payload[1] | (cmd.payload[2] << 8);
+
+                // Rate limiting: minimum intervals to prevent overload
+                const uint16_t MIN_INTERVAL_SINGLE = 30;   // 30ms for single peripheral
+                const uint16_t MIN_INTERVAL_ALL = 100;      // 100ms for PID_ALL
+
+                uint16_t minInterval = (cmd.peripheralId == PERIPHERAL_ID_ALL) ? MIN_INTERVAL_ALL : MIN_INTERVAL_SINGLE;
+
+                if (interval < minInterval) {
+                    Serial.printf("[RATE_LIMIT] PID=0x%02X interval=%ums < min=%ums - REJECTED\n",
+                        cmd.peripheralId, interval, minInterval);
+                    sendErrorResponse(cmd.peripheralId, ERROR_INVALID_CMD);
+                } else {
+                    enableAutonomousSend(cmd.peripheralId, interval);
+                    sendAckResponse(cmd.peripheralId);
+                }
+            } else {
+                sendErrorResponse(cmd.peripheralId, ERROR_INVALID_CMD);
             }
+            break;
+
+        case CMD_STOP_POLL:
+            // Disable autonomous sending
+            disableAutonomousSend(cmd.peripheralId);
+            sendAckResponse(cmd.peripheralId);
+            break;
+
+        case CMD_SYSTEM_STATUS:
+        case CMD_SYSTEM_WAKEUP:
+            // Send system status (system commands)
+            sendSystemStatus();
+            break;
+
+        default:
+            // Unknown command
+            sendErrorResponse(cmd.peripheralId, ERROR_INVALID_CMD);
+            break;
+    }
+}
+
+void handleGetAllPeripherals() {
+    // Handle PID_ALL request - queue responses for each peripheral
+    // This sends data for all peripherals, one per loop iteration
+
+    // Rate limit: max one PID_ALL request per 100ms
+    static uint32_t lastPidAllTime = 0;
+    uint32_t now = millis();
+
+    if (now - lastPidAllTime < 100) {
+        sendErrorResponse(PERIPHERAL_ID_ALL, ERROR_INVALID_CMD);
+        return;
+    }
+    lastPidAllTime = now;
+
+    // Check if queue has room for 4 responses (one for each peripheral)
+    if (commandQueue.size() + 4 > MAX_QUEUE_SIZE) {
+        sendErrorResponse(PERIPHERAL_ID_ALL, ERROR_QUEUE_FULL);
+        return;
+    }
+
+    // Queue internal response commands for each peripheral
+    Command responseCmd;
+    responseCmd.command = CMD_GET_ALL;
+    responseCmd.payloadLen = 0;
+
+    // Queue LoRa 915MHz response
+    responseCmd.peripheralId = PERIPHERAL_ID_LORA_915;
+    commandQueue.enqueue(responseCmd);
+
+    // Queue 433MHz response
+    responseCmd.peripheralId = PERIPHERAL_ID_RADIO_433;
+    commandQueue.enqueue(responseCmd);
+
+    // Queue Barometer response
+    responseCmd.peripheralId = PERIPHERAL_ID_BAROMETER;
+    commandQueue.enqueue(responseCmd);
+
+    // Queue Current sensor response
+    responseCmd.peripheralId = PERIPHERAL_ID_CURRENT;
+    commandQueue.enqueue(responseCmd);
+
+    // Note: No ACK sent - Pi will receive 4 data responses instead
+}
+
+// ====================================================================
+// PRIORITY 3: UPDATE PERIPHERALS (NON-BLOCKING)
+// ====================================================================
+
+void updatePeripherals() {
+    uint32_t now = millis();
+
+    // Check each peripheral's polling schedule
+    for (int i = 0; i < MAX_POLLERS; i++) {
+        if (!pollers[i].enabled) {
+            continue;
         }
-        else if (command == "current") {
-            Serial.printf("Current Sensor Status: %s\n", currentSensorInitialized ? "Online" : "Offline");
-            if (currentSensorInitialized) {
-                Serial.printf("V: %.3fV, I: %.3fA, P: %.3fW\n", 
-                             latestCurrentData.voltage_v, latestCurrentData.current_a, latestCurrentData.power_w);
+
+        if (now - pollers[i].lastPollTime >= pollers[i].pollInterval) {
+            // Time to update this peripheral
+            switch (pollers[i].peripheralId) {
+                case PERIPHERAL_ID_LORA_915:
+                case PERIPHERAL_ID_RADIO_433:
+                    // Non-blocking: check if radio data available
+                    dataCollector.pollRadios();
+                    break;
+
+                case PERIPHERAL_ID_BAROMETER:
+                case PERIPHERAL_ID_CURRENT:
+                    // I2C read (~5ms blocking, acceptable)
+                    dataCollector.pollSensors();
+                    break;
+
+                case PERIPHERAL_ID_SYSTEM:
+                    // Update system stats (fast)
+                    dataCollector.updateSystemStatus();
+                    break;
             }
+
+            pollers[i].lastPollTime = now;
         }
-        else if (command == "reboot") {
-            Serial.println("Rebooting...");
-            ESP.restart();
+    }
+}
+
+// ====================================================================
+// PRIORITY 4: SEND AUTONOMOUS DATA
+// ====================================================================
+
+void sendAutonomousData() {
+    uint32_t now = millis();
+
+    // Check PID_ALL first (special handling)
+    if (allPeripheralsPoller.autonomousSendEnabled) {
+        if (now - allPeripheralsPoller.lastSendTime >= allPeripheralsPoller.pollInterval) {
+            // Send all peripherals by calling handleGetAllPeripherals
+            Serial.printf("[AUTO] Sending PID_ALL batch\n");
+            handleGetAllPeripherals();
+            allPeripheralsPoller.lastSendTime = now;
+            return;  // Send only one batch per loop iteration
         }
-        else if (command.length() > 0) {
-            Serial.println("Unknown command. Type 'help' for commands.");
+    }
+
+    // Check each peripheral for autonomous sending
+    // Send at most ONE peripheral per loop iteration to avoid blocking
+    for (int i = 0; i < MAX_POLLERS; i++) {
+        if (!pollers[i].autonomousSendEnabled) {
+            continue;
         }
+
+        // Check if it's time to send (use separate lastSendTime, not lastPollTime)
+        if (now - pollers[i].lastSendTime >= pollers[i].pollInterval) {
+            sendPeripheralData(pollers[i].peripheralId);
+            pollers[i].lastSendTime = now;  // Update send timestamp
+            return;  // Send only one per loop iteration
+        }
+    }
+}
+
+// ====================================================================
+// PROTOCOL FUNCTIONS
+// ====================================================================
+
+uint8_t calculateChecksum(uint8_t pid, uint8_t len, const uint8_t* payload) {
+    uint8_t chk = pid ^ len;
+    for (uint8_t i = 0; i < len; i++) {
+        chk ^= payload[i];
+    }
+    return chk;
+}
+
+void sendHybridFrame(uint8_t pid, const uint8_t* payload, size_t len) {
+    if (len > HYBRID_MAX_PAYLOAD_SIZE) {
+        return;  // Payload too large
+    }
+
+    uint8_t chk = calculateChecksum(pid, len, payload);
+
+    // Build frame: <AA55[PID][LEN][PAYLOAD_HEX][CHK]55AA>\n
+    Serial.print('<');
+    Serial.print("AA55");
+    Serial.printf("%02X", pid);
+    Serial.printf("%02X", (uint8_t)len);
+
+    // Payload as hex
+    for (size_t i = 0; i < len; i++) {
+        Serial.printf("%02X", payload[i]);
+    }
+
+    Serial.printf("%02X", chk);
+    Serial.print("55AA>\n");
+}
+
+bool parseHybridFrame(const char* frame, uint8_t* pid, uint8_t* cmd,
+                      uint8_t* payload, uint8_t* payloadLen) {
+    // Expected format: <AA55[PID][LEN][PAYLOAD_HEX][CHK]55AA>
+
+    // Check frame markers
+    if (frame[0] != '<') {
+        return false;
+    }
+
+    size_t frameLen = strlen(frame);
+    if (frameLen < 12 || frame[frameLen - 1] != '>') {
+        return false;  // Too short or missing '>'
+    }
+
+    // Check start markers: AA55
+    if (strncmp(frame + 1, "AA55", 4) != 0) {
+        return false;
+    }
+
+    // Parse PID (2 hex chars)
+    char pidStr[3] = {frame[5], frame[6], '\0'};
+    *pid = (uint8_t)strtol(pidStr, nullptr, 16);
+
+    // Parse length (2 hex chars)
+    char lenStr[3] = {frame[7], frame[8], '\0'};
+    uint8_t len = (uint8_t)strtol(lenStr, nullptr, 16);
+
+    // Check frame length matches
+    size_t expectedLen = 1 + 4 + 2 + 2 + (len * 2) + 2 + 4 + 1;  // <AA55PPLL[data]CHKSUM55AA>
+    if (frameLen < expectedLen) {
+        return false;
+    }
+
+    // Parse payload (each byte is 2 hex chars)
+    for (uint8_t i = 0; i < len; i++) {
+        char byteStr[3] = {frame[9 + i * 2], frame[10 + i * 2], '\0'};
+        payload[i] = (uint8_t)strtol(byteStr, nullptr, 16);
+    }
+    *payloadLen = len;
+
+    // Extract command (first byte of payload)
+    if (len > 0) {
+        *cmd = payload[0];
+    } else {
+        *cmd = 0;
+    }
+
+    // Parse checksum (2 hex chars)
+    size_t chkPos = 9 + len * 2;
+    char chkStr[3] = {frame[chkPos], frame[chkPos + 1], '\0'};
+    uint8_t rxChk = (uint8_t)strtol(chkStr, nullptr, 16);
+
+    // Verify checksum
+    uint8_t calcChk = calculateChecksum(*pid, len, payload);
+    if (rxChk != calcChk) {
+        return false;
+    }
+
+    // Check end markers: 55AA
+    if (strncmp(frame + chkPos + 2, "55AA", 4) != 0) {
+        return false;
+    }
+
+    return true;
+}
+
+// ====================================================================
+// RESPONSE FUNCTIONS
+// ====================================================================
+
+void sendPeripheralData(uint8_t pid) {
+    uint8_t buffer[HYBRID_MAX_PAYLOAD_SIZE];
+    size_t len = 0;
+
+    switch (pid) {
+        case PERIPHERAL_ID_LORA_915:
+            len = dataCollector.packLoRaData(buffer, HYBRID_MAX_PAYLOAD_SIZE);
+            break;
+
+        case PERIPHERAL_ID_RADIO_433:
+            len = dataCollector.pack433Data(buffer, HYBRID_MAX_PAYLOAD_SIZE);
+            break;
+
+        case PERIPHERAL_ID_BAROMETER:
+            len = dataCollector.packBarometerData(buffer, HYBRID_MAX_PAYLOAD_SIZE);
+            break;
+
+        case PERIPHERAL_ID_CURRENT:
+            len = dataCollector.packCurrentData(buffer, HYBRID_MAX_PAYLOAD_SIZE);
+            break;
+
+        case PERIPHERAL_ID_SYSTEM:
+            sendSystemStatus();
+            return;
+
+        default:
+            sendErrorResponse(pid, ERROR_INVALID_PID);
+            return;
+    }
+
+    if (len > 0) {
+        sendHybridFrame(pid, buffer, len);
+    } else {
+        sendErrorResponse(pid, ERROR_INVALID_PID);
+    }
+}
+
+void sendAckResponse(uint8_t pid) {
+    uint8_t ackPayload[1] = {RESP_ACK};
+    sendHybridFrame(pid, ackPayload, 1);
+}
+
+void sendErrorResponse(uint8_t pid, uint8_t errorCode) {
+    uint8_t errorPayload[2] = {RESP_ERROR, errorCode};
+    sendHybridFrame(pid, errorPayload, 2);
+}
+
+void sendSystemStatus() {
+    // Use DataCollector's packStatus method to get proper WireStatus_t format (20 bytes)
+    uint8_t buffer[HYBRID_MAX_PAYLOAD_SIZE];
+    size_t len = dataCollector.packStatus(buffer, HYBRID_MAX_PAYLOAD_SIZE);
+
+    if (len > 0) {
+        sendHybridFrame(PERIPHERAL_ID_SYSTEM, buffer, len);
+    } else {
+        // Fallback: send error
+        sendErrorResponse(PERIPHERAL_ID_SYSTEM, ERROR_INVALID_PID);
+    }
+}
+
+// ====================================================================
+// POLLING CONTROL FUNCTIONS
+// ====================================================================
+
+PeripheralPoller* findPoller(uint8_t pid) {
+    for (int i = 0; i < MAX_POLLERS; i++) {
+        if (pollers[i].peripheralId == pid) {
+            return &pollers[i];
+        }
+    }
+    return nullptr;
+}
+
+void enablePolling(uint8_t pid, uint16_t interval) {
+    PeripheralPoller* poller = findPoller(pid);
+    if (poller) {
+        poller->enabled = true;
+        if (interval > 0) {
+            poller->pollInterval = interval;
+        }
+    }
+}
+
+void disablePolling(uint8_t pid) {
+    PeripheralPoller* poller = findPoller(pid);
+    if (poller) {
+        poller->enabled = false;
+    }
+}
+
+void enableAutonomousSend(uint8_t pid, uint16_t interval) {
+    // Special handling for PID_ALL
+    if (pid == PERIPHERAL_ID_ALL) {
+        allPeripheralsPoller.enabled = true;
+        allPeripheralsPoller.autonomousSendEnabled = true;
+        allPeripheralsPoller.lastSendTime = millis();
+        if (interval > 0) {
+            allPeripheralsPoller.pollInterval = interval;
+        }
+        Serial.printf("[AUTO] PID=0x%02X (ALL) interval=%ums\n", pid, allPeripheralsPoller.pollInterval);
+        return;
+    }
+
+    // Normal peripheral handling
+    PeripheralPoller* poller = findPoller(pid);
+    if (poller) {
+        poller->enabled = true;
+        poller->autonomousSendEnabled = true;
+        poller->lastSendTime = millis();  // Initialize send timer
+        if (interval > 0) {
+            poller->pollInterval = interval;
+        }
+        // Debug: Show what was configured
+        Serial.printf("[AUTO] PID=0x%02X interval=%ums\n", pid, poller->pollInterval);
+    }
+}
+
+void disableAutonomousSend(uint8_t pid) {
+    // Special handling for PID_ALL
+    if (pid == PERIPHERAL_ID_ALL) {
+        allPeripheralsPoller.autonomousSendEnabled = false;
+        return;
+    }
+
+    // Normal peripheral handling
+    PeripheralPoller* poller = findPoller(pid);
+    if (poller) {
+        poller->autonomousSendEnabled = false;
     }
 }
