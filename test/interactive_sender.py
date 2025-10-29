@@ -7,10 +7,10 @@ display responses in real-time.
 
 HYBRID PROTOCOL:
 ================
-Wire format: <AA55[PID][LEN][PAYLOAD_HEX][CHK]55AA>\n
+Wire format (pure binary): <AA55[PID][LEN][PAYLOAD][CHK]55AA>
 
-Example: <AA5501010000AA55AA>\n
-         └─ PID=01 (LoRa), LEN=01, CMD=00 (GET_ALL), CHK=00
+Example (hex): 3C AA 55 01 01 00 01 55 AA 3E
+               └─ PID=01 (LoRa), LEN=01, CMD=00 (GET_ALL), CHK=00
 
 Peripheral IDs:
   0x00 - SYSTEM (ESP32 control)
@@ -80,11 +80,13 @@ GENERIC_COMMANDS = {
 
 # System commands (only for PERIPHERAL_ID=0x00)
 SYSTEM_COMMANDS = {
-    "SYSTEM_STATUS":  0x20,
-    "SYSTEM_WAKEUP":  0x21,
-    "SYSTEM_SLEEP":   0x22,
-    "SYSTEM_RESET":   0x23,
-    "SYSTEM_PERF":    0x24,  # Toggle performance stats (payload: 0=off, 1=on)
+    "SYSTEM_STATUS":      0x20,
+    "SYSTEM_WAKEUP":      0x21,
+    "SYSTEM_SLEEP":       0x22,
+    "SYSTEM_RESET":       0x23,
+    "SYSTEM_PERF":        0x24,  # Toggle performance stats (payload: 0=off, 1=on)
+    "SYSTEM_STATS":       0x25,  # Get transfer statistics
+    "SYSTEM_STATS_RESET": 0x26,  # Reset transfer statistics
 }
 
 # Data structure sizes (for validation and parsing)
@@ -94,6 +96,7 @@ SIZE_LORA = 74       # WireLoRa_t
 SIZE_433 = 74        # Wire433_t (same as LoRa)
 SIZE_BAROMETER = 17  # WireBarometer_t
 SIZE_CURRENT = 19    # WireCurrent_t
+SIZE_TRANSFER_STATS = 41  # WireTransferStats_t (1 + 5*8)
 
 # ====================================================================
 # DATA STRUCTURE UNPACKING FUNCTIONS
@@ -225,6 +228,32 @@ def unpack_current_data(data):
 
     return result
 
+def unpack_transfer_stats(data):
+    """Unpack WireTransferStats_t (41 bytes): version(1), stats[5] (each: packets(4), bytes(4))"""
+    result = {'partial': len(data) != SIZE_TRANSFER_STATS, 'actual_length': len(data), 'expected_length': SIZE_TRANSFER_STATS}
+    offset = 0
+
+    if len(data) >= offset + 1:
+        result['version'] = struct.unpack('<B', data[offset:offset+1])[0]
+        offset += 1
+
+    # Unpack stats for each peripheral (SYSTEM, LORA_915, RADIO_433, BAROMETER, CURRENT)
+    peripheral_names = ['SYSTEM', 'LORA_915', 'RADIO_433', 'BAROMETER', 'CURRENT']
+    result['peripherals'] = {}
+
+    for name in peripheral_names:
+        if len(data) >= offset + 8:  # 4 bytes packets + 4 bytes bytes
+            total_packets = struct.unpack('<I', data[offset:offset+4])[0]
+            offset += 4
+            total_bytes = struct.unpack('<I', data[offset:offset+4])[0]
+            offset += 4
+            result['peripherals'][name] = {
+                'total_packets': total_packets,
+                'total_bytes': total_bytes
+            }
+
+    return result
+
 # ====================================================================
 # PROTOCOL FUNCTIONS
 # ====================================================================
@@ -238,14 +267,14 @@ def calculate_checksum(pid, length, payload):
 
 def encode_hybrid_frame(peripheral_id, payload):
     """
-    Encode hybrid protocol frame.
+    Encode hybrid protocol frame (pure binary).
 
     Args:
         peripheral_id: Peripheral ID (0x00-0xFF)
         payload: Payload bytes (includes command as first byte)
 
     Returns:
-        ASCII frame with newline terminator
+        Binary frame: <AA55[PID][LEN][PAYLOAD][CHK]55AA>
     """
     if len(payload) > 255:
         raise ValueError(f"Payload too long: {len(payload)} bytes (max 255)")
@@ -253,75 +282,70 @@ def encode_hybrid_frame(peripheral_id, payload):
     # Calculate checksum
     checksum = calculate_checksum(peripheral_id, len(payload), payload)
 
-    # Build frame: <AA55[PID][LEN][PAYLOAD_HEX][CHK]55AA>\n
-    frame = '<'
-    frame += 'AA55'  # Start markers
-    frame += f'{peripheral_id:02X}'  # PID
-    frame += f'{len(payload):02X}'  # Length
-    frame += payload.hex().upper()  # Payload as hex
-    frame += f'{checksum:02X}'  # Checksum
-    frame += '55AA'  # End markers
-    frame += '>\n'  # End + newline
+    # Build frame: <AA55[PID][LEN][PAYLOAD][CHK]55AA> (pure binary)
+    frame = b'<'
+    frame += b'\xAA\x55'  # Start markers
+    frame += bytes([peripheral_id])  # PID
+    frame += bytes([len(payload)])  # Length
+    frame += payload  # Payload (raw bytes)
+    frame += bytes([checksum])  # Checksum
+    frame += b'\x55\xAA'  # End markers
+    frame += b'>'  # End marker
 
-    return frame.encode('ascii')
+    return frame
+
+def format_frame_hex(frame):
+    """Format binary frame as readable hex string"""
+    return ' '.join(f'{b:02X}' for b in frame)
 
 def decode_hybrid_frame(line):
     """
-    Decode hybrid protocol frame.
+    Decode hybrid protocol frame (pure binary).
 
     Args:
-        line: Bytes received from serial (should end with \\n)
+        line: Bytes received from serial
 
     Returns:
         (pid, payload) if valid, (None, None) if invalid
     """
     try:
-        line = line.decode('ascii').strip()
+        # Minimum frame: < AA 55 PID LEN CHK 55 AA > = 9 bytes
+        if len(line) < 9:
+            return None, None
 
         # Check frame markers
-        if not line.startswith('<') or not line.endswith('>'):
+        if line[0] != ord('<') or line[-1] != ord('>'):
             return None, None
 
-        # Remove < > markers
-        line = line[1:-1]
-
-        # Minimum: AA55PPLL55AA = 12 chars
-        if len(line) < 12:
+        # Check start markers: AA55
+        if line[1] != 0xAA or line[2] != 0x55:
             return None, None
 
-        # Check start markers
-        if not line.startswith('AA55'):
+        # Parse PID and length
+        pid = line[3]
+        length = line[4]
+
+        # Calculate expected length: < AA 55 PID LEN [payload...] CHK 55 AA > = 9 + length
+        expected_len = 9 + length
+        if len(line) != expected_len:
             return None, None
 
-        # Parse PID
-        pid = int(line[4:6], 16)
-
-        # Parse length
-        length = int(line[6:8], 16)
-
-        # Calculate expected length
-        expected_len = 4 + 2 + 2 + (length * 2) + 2 + 4
-        if len(line) < expected_len:
-            return None, None
-
-        # Parse payload
-        payload_hex = line[8:8 + (length * 2)]
-        payload = bytes.fromhex(payload_hex)
+        # Extract payload
+        payload = line[5:5 + length]
 
         # Parse checksum
-        rx_chk = int(line[8 + (length * 2):8 + (length * 2) + 2], 16)
+        rx_chk = line[5 + length]
 
         # Verify checksum
         calc_chk = calculate_checksum(pid, length, payload)
         if rx_chk != calc_chk:
             return None, None
 
-        # Check end markers
-        end_markers = line[8 + (length * 2) + 2:8 + (length * 2) + 2 + 4]
-        if end_markers != '55AA':
+        # Check end markers: 55 AA
+        if line[6 + length] != 0x55 or line[7 + length] != 0xAA:
             return None, None
 
-        return pid, payload
+        return pid, bytes(payload)
 
     except Exception as e:
         return None, None
@@ -353,6 +377,10 @@ class HybridProtocolGUI:
             'ms_per_loop': 0.0,
             'queue_size': 0
         }
+
+        # Transfer statistics
+        self.transfer_stats = None  # Will be populated when stats are requested
+        self.stats_window = None    # Reference to stats popup window
 
         self.create_widgets()
         self.refresh_ports()
@@ -431,6 +459,7 @@ class HybridProtocolGUI:
             ("Stop All Polling", self.stop_all_polling),
             ("Enable Perf Stats", lambda: self.toggle_perf_stats(True)),
             ("Disable Perf Stats", lambda: self.toggle_perf_stats(False)),
+            ("Transfer Statistics", self.show_transfer_stats),
         ]
 
         for text, cmd in buttons:
@@ -579,7 +608,7 @@ class HybridProtocolGUI:
 
         # Log
         self.log(f"[TX] {peripheral_name} → {command_name}", "tx")
-        self.log(f"     {frame.decode('ascii').strip()}", "tx")
+        self.log(f"     {format_frame_hex(frame)}", "tx")
         if command_name == "SET_POLL_RATE":
             interval_ms = int(self.interval_var.get())
             self.log(f"     Interval: {interval_ms}ms", "tx")
@@ -613,7 +642,7 @@ class HybridProtocolGUI:
 
         self.autonomous_enabled[peripheral_id] = True
         self.log(f"[TX] {peripheral_name} → SET_POLL_RATE", "tx")
-        self.log(f"     {frame.decode('ascii').strip()}", "tx")
+        self.log(f"     {format_frame_hex(frame)}", "tx")
         self.log(f"     Started polling every {interval_ms}ms", "info")
 
     def toggle_perf_stats(self, enable):
@@ -632,7 +661,7 @@ class HybridProtocolGUI:
         self.ser.write(frame)
 
         self.log(f"[TX] SYSTEM → SYSTEM_PERF ({'ENABLE' if enable else 'DISABLE'})", "tx")
-        self.log(f"     {frame.decode('ascii').strip()}", "tx")
+        self.log(f"     {format_frame_hex(frame)}", "tx")
 
     def stop_all_polling(self):
         """Stop autonomous polling for all peripherals"""
@@ -655,50 +684,193 @@ class HybridProtocolGUI:
 
         self.log("[INFO] Stopped all autonomous polling", "info")
 
+    def show_transfer_stats(self):
+        """Show transfer statistics popup window"""
+        if not self.connected:
+            messagebox.showwarning("Not Connected", "Please connect to serial port first")
+            return
+
+        # Request stats from ESP32
+        peripheral_id = PERIPHERALS["SYSTEM"]
+        command = SYSTEM_COMMANDS["SYSTEM_STATS"]
+        payload = bytes([command])
+        frame = encode_hybrid_frame(peripheral_id, payload)
+        self.ser.write(frame)
+
+        self.log("[TX] SYSTEM → SYSTEM_STATS", "tx")
+        self.log(f"     {format_frame_hex(frame)}", "tx")
+
+        # Stats will be received via rx_worker and stored in self.transfer_stats
+        # The popup will display when data arrives (handled in decode_payload)
+
+    def open_stats_popup(self):
+        """Open the statistics popup window with current stats"""
+        if self.stats_window is not None and self.stats_window.winfo_exists():
+            # Window already open, just bring to front and update
+            self.stats_window.lift()
+            self.update_stats_display()
+            return
+
+        # Create new popup window
+        self.stats_window = tk.Toplevel(self.root)
+        self.stats_window.title("Transfer Statistics")
+        self.stats_window.geometry("400x300")
+
+        # Title
+        title_label = ttk.Label(self.stats_window, text="Data Transfer Statistics",
+                                font=('Consolas', 12, 'bold'))
+        title_label.pack(pady=10)
+
+        # Stats display frame
+        stats_frame = ttk.Frame(self.stats_window, padding=10)
+        stats_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Create labels for each peripheral
+        self.stats_labels = {}
+        peripheral_names = ['SYSTEM', 'LORA_915', 'RADIO_433', 'BAROMETER', 'CURRENT']
+
+        for i, name in enumerate(peripheral_names):
+            # Peripheral name
+            name_label = ttk.Label(stats_frame, text=f"{name}:", font=('Consolas', 10, 'bold'))
+            name_label.grid(row=i, column=0, sticky=tk.W, padx=5, pady=5)
+
+            # Stats text
+            stats_label = ttk.Label(stats_frame, text="Loading...", font=('Consolas', 9))
+            stats_label.grid(row=i, column=1, sticky=tk.W, padx=5, pady=5)
+            self.stats_labels[name] = stats_label
+
+        # Button frame
+        button_frame = ttk.Frame(self.stats_window)
+        button_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        ttk.Button(button_frame, text="Refresh", command=self.show_transfer_stats).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Reset Stats", command=self.reset_transfer_stats).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Close", command=self.stats_window.destroy).pack(side=tk.RIGHT, padx=5)
+
+        # Update display if we already have stats
+        if self.transfer_stats:
+            self.update_stats_display()
+
+    def update_stats_display(self):
+        """Update the statistics display in the popup window"""
+        if not self.transfer_stats or not hasattr(self, 'stats_labels'):
+            return
+
+        peripherals = self.transfer_stats.get('peripherals', {})
+
+        for name, label in self.stats_labels.items():
+            if name in peripherals:
+                stats = peripherals[name]
+                packets = stats['total_packets']
+                bytes_total = stats['total_bytes']
+                # Format bytes nicely (KB, MB, etc.)
+                if bytes_total < 1024:
+                    bytes_str = f"{bytes_total} B"
+                elif bytes_total < 1024 * 1024:
+                    bytes_str = f"{bytes_total / 1024:.2f} KB"
+                else:
+                    bytes_str = f"{bytes_total / (1024 * 1024):.2f} MB"
+
+                label.config(text=f"{packets:,} packets, {bytes_str}")
+            else:
+                label.config(text="No data")
+
+    def reset_transfer_stats(self):
+        """Reset transfer statistics on ESP32"""
+        if not self.connected:
+            messagebox.showwarning("Not Connected", "Please connect to serial port first")
+            return
+
+        # Confirm with user
+        if not messagebox.askyesno("Reset Statistics",
+                                   "Are you sure you want to reset all transfer statistics?\n\n"
+                                   "This will reset the persistent counters stored on the ESP32."):
+            return
+
+        # Send reset command
+        peripheral_id = PERIPHERALS["SYSTEM"]
+        command = SYSTEM_COMMANDS["SYSTEM_STATS_RESET"]
+        payload = bytes([command])
+        frame = encode_hybrid_frame(peripheral_id, payload)
+        self.ser.write(frame)
+
+        self.log("[TX] SYSTEM → SYSTEM_STATS_RESET", "tx")
+        self.log(f"     {format_frame_hex(frame)}", "tx")
+
+        # Request updated stats after a short delay
+        self.root.after(1000, self.show_transfer_stats)
+
     def rx_worker(self):
         """Background thread to receive and display responses"""
+        frame_buffer = bytearray()
+
         while self.rx_running:
             try:
-                if self.ser and self.ser.in_waiting > 0:
-                    line = self.ser.readline()
+                # Only sleep if no data available
+                if not self.ser or self.ser.in_waiting == 0:
+                    time.sleep(0.001)  # 1ms sleep when idle
+                    continue
 
-                    if line:
-                        # Check if it's a performance stats line
-                        line_str = line.decode('ascii', errors='ignore').strip()
+                # Read one byte at a time, looking for complete frames ending with '>'
+                byte = self.ser.read(1)
+                if not byte:
+                    continue
+
+                frame_buffer.extend(byte)
+
+                # Check if frame is complete (ends with '>')
+                if byte[0] == ord('>'):
+                    line = bytes(frame_buffer)
+                    frame_buffer.clear()
+
+                    # Check if it's a debug/info line (starts with '[')
+                    line_str = line.decode('ascii', errors='ignore').strip()
+                    if line_str.startswith('[PERF]'):
+                        self.parse_perf_stats(line_str)
+                        continue
+                    elif line_str.startswith('['):
+                        # All bracketed messages are debug/info - show in log
+                        # Includes: [DEBUG], [AUTO], [RATE_LIMIT], [INFO], [SEND], etc.
+                        self.log(line_str, "info")
+                        continue
+
+                    pid, payload = decode_hybrid_frame(line)
+
+                    if pid is not None:
+                        # Find peripheral name
+                        peripheral_name = "UNKNOWN"
+                        for name, pid_val in PERIPHERALS.items():
+                            if pid_val == pid:
+                                peripheral_name = name
+                                break
+
+                        self.log(f"[RX] {peripheral_name} (PID=0x{pid:02X}): {len(payload)} bytes", "rx")
+                        self.log(f"     {format_frame_hex(line)}", "rx")
+
+                        # Decode payload if possible
+                        self.decode_payload(peripheral_name, payload)
+                        self.log("")  # Blank line for readability
+                    else:
+                        # Not a valid frame, might be debug output
+                        if line_str:
+                            self.log(line_str, "info")
+
+                # Handle case where frame starts with '[' (debug message)
+                # These are text lines ending with '\n', not binary frames
+                elif frame_buffer and frame_buffer[0] == ord('['):
+                    # Check if we have a complete line (ends with \n)
+                    if byte[0] in (ord('\n'), ord('\r')):
+                        line_str = frame_buffer.decode('ascii', errors='ignore').strip()
+                        frame_buffer.clear()
+
                         if line_str.startswith('[PERF]'):
                             self.parse_perf_stats(line_str)
-                            continue
-                        elif line_str.startswith('[DEBUG]') or line_str.startswith('[AUTO]') or line_str.startswith('[RATE_LIMIT]'):
-                            # Show debug messages in log
+                        elif line_str.startswith('['):
                             self.log(line_str, "info")
-                            continue
-                        elif line_str.startswith('[SEND]'):
-                            # Show send timing debug in log
-                            self.log(line_str, "info")
-                            continue
 
-                        pid, payload = decode_hybrid_frame(line)
-
-                        if pid is not None:
-                            # Find peripheral name
-                            peripheral_name = "UNKNOWN"
-                            for name, pid_val in PERIPHERALS.items():
-                                if pid_val == pid:
-                                    peripheral_name = name
-                                    break
-
-                            self.log(f"[RX] {peripheral_name} (PID=0x{pid:02X}): {len(payload)} bytes", "rx")
-                            self.log(f"     {line.decode('ascii').strip()}", "rx")
-
-                            # Decode payload if possible
-                            self.decode_payload(peripheral_name, payload)
-                            self.log("")  # Blank line for readability
-                        else:
-                            # Not a valid frame, might be debug output
-                            if line_str:
-                                self.log(line_str, "info")
-
-                time.sleep(0.01)
+                # Prevent buffer overflow from malformed data
+                if len(frame_buffer) > 512:
+                    frame_buffer.clear()
 
             except Exception as e:
                 if self.rx_running:  # Only log if not intentionally stopped
@@ -769,6 +941,24 @@ class HybridProtocolGUI:
                     self.log(f"         433MHz Packets: {data.get('pkt_count_433', '?')}", "rx")
                     self.log(f"         Heap Free: {data.get('heap_free', '?')} bytes", "rx")
                     self.log(f"         Chip Rev: {data.get('chip_revision', '?')}", "rx")
+                elif len(payload) == SIZE_TRANSFER_STATS:
+                    data = unpack_transfer_stats(payload)
+                    self.transfer_stats = data  # Store for popup window
+                    self.log("     → Transfer Statistics (WireTransferStats_t):", "rx")
+                    self.log(f"         Version: {data.get('version', '?')}", "rx")
+                    peripherals = data.get('peripherals', {})
+                    for name, stats in peripherals.items():
+                        packets = stats['total_packets']
+                        bytes_total = stats['total_bytes']
+                        if bytes_total < 1024:
+                            bytes_str = f"{bytes_total} B"
+                        elif bytes_total < 1024 * 1024:
+                            bytes_str = f"{bytes_total / 1024:.2f} KB"
+                        else:
+                            bytes_str = f"{bytes_total / (1024 * 1024):.2f} MB"
+                        self.log(f"         {name}: {packets:,} packets, {bytes_str}", "rx")
+                    # Open/update popup window
+                    self.root.after(0, self.open_stats_popup)
                 else:
                     self.log(f"     → Unknown SYSTEM payload: {len(payload)} bytes", "rx")
                     self.log(f"     → Hex: {payload.hex().upper()}", "rx")

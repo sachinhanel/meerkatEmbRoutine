@@ -50,32 +50,33 @@
 
 
 // ====================================================================
-// HYBRID PROTOCOL - Binary + ASCII Hex Framing + Newline
+// HYBRID PROTOCOL - Binary with Frame Markers
 // ====================================================================
 //
-// Format: <AA55[PID][LEN][PAYLOAD_HEX][CHK]55AA>\n
+// Format: <AA55[PID][LEN][PAYLOAD][CHK]55AA>
 //
-// Frame Structure:
-//   '<'          - Start marker (1 byte ASCII)
-//   'AA55'       - Protocol header (4 bytes ASCII hex)
-//   [PID]        - Peripheral ID (2 bytes ASCII hex, e.g., "01" = 0x01)
-//   [LEN]        - Payload length (2 bytes ASCII hex, e.g., "4A" = 74 bytes)
-//   [PAYLOAD]    - Payload data (LEN*2 bytes ASCII hex, e.g., "0123" = 0x01,0x23)
-//   [CHK]        - Checksum: PID ^ LEN ^ payload bytes (2 bytes ASCII hex)
-//   '55AA'       - Protocol footer (4 bytes ASCII)
-//   '>'          - End marker (1 byte ASCII)
-//   '\n'         - Newline terminator
+// Frame Structure (Pure Binary):
+//   '<'          - Start marker (0x3C)
+//   0xAA 0x55    - Protocol header (2 bytes)
+//   [PID]        - Peripheral ID (1 byte, e.g., 0x01 = LoRa)
+//   [LEN]        - Payload length (1 byte, 0-255)
+//   [PAYLOAD]    - Payload data (LEN bytes, raw binary)
+//   [CHK]        - Checksum: PID ^ LEN ^ payload bytes (1 byte)
+//   0x55 0xAA    - Protocol footer (2 bytes)
+//   '>'          - End marker (0x3E)
+//
+// Total frame size: 9 + LEN bytes
 //
 // Benefits:
-//   - Human-readable in terminal/serial monitor
-//   - Binary data encoded as ASCII hex
-//   - Newline-delimited for easy parsing
-//   - Checksum for error detection
+//   - Compact: ~50% smaller than ASCII hex encoding
+//   - Fast: No encoding/decoding overhead
+//   - Reliable: Frame markers + checksum
+//   - Delimitable: < and > markers for frame boundaries
 //
-// Examples:
-//   Get LoRa data:  <AA55010100010155AA>
-//   Response:       <AA550104A[148 hex chars]XX55AA>
-//   Error response: <AA5501 02FF04XX55AA> (FF = error, 04 = invalid PID)
+// Examples (shown as hex bytes):
+//   Get LoRa:  3C AA 55 01 01 00 01 55 AA 3E (10 bytes)
+//   Response:  3C AA 55 01 4A [74 bytes] XX 55 AA 3E (83 bytes)
+//   Error:     3C AA 55 01 02 FF 04 XX 55 AA 3E (11 bytes)
 //
 // Payload Format:
 //   First byte: Command byte (0x00-0xFF)
@@ -123,7 +124,9 @@
 #define CMD_SYSTEM_SLEEP    0x22  // Put system into low-power state
 #define CMD_SYSTEM_RESET    0x23  // Reset entire ESP32
 #define CMD_SYSTEM_PERF     0x24  // Toggle performance stats output (payload: 1 byte, 0=off, 1=on)
-// 0x25-0x2F reserved for future system commands
+#define CMD_SYSTEM_STATS    0x25  // Get transfer statistics (WireTransferStats_t, 41 bytes)
+#define CMD_SYSTEM_STATS_RESET 0x26  // Reset transfer statistics
+// 0x27-0x2F reserved for future system commands
 
 // ====================================================================
 // PERIPHERAL-SPECIFIC COMMANDS (0x10-0x1F) - Future expansion

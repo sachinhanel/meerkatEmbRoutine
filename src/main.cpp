@@ -6,7 +6,7 @@
  * - Priority-based event loop (no FreeRTOS tasks)
  * - Command queue for Pi requests
  * - Non-blocking peripheral polling
- * - Hybrid protocol (binary structure + newline framing)
+ * - Hybrid protocol (pure binary with <> frame markers)
  *
  * Loop Priority:
  * 1. Read and queue incoming Pi commands (non-blocking)
@@ -18,6 +18,7 @@
 #include <Arduino.h>
 #include "config.h"
 #include "DataCollector.h"
+#include "TransferStats.h"
 
 // Optionally keep FlightDataReplay for testing
 #ifdef TEST_MODE
@@ -29,7 +30,7 @@
 // ====================================================================
 // Note: Peripheral IDs and commands are defined in config.h
 
-// Frame format: <AA55[PID][LEN][PAYLOAD_HEX][CHK]55AA>\n
+// Frame format (pure binary): <AA55[PID][LEN][PAYLOAD][CHK]55AA>
 #define HYBRID_MAX_FRAME_SIZE 512
 #define HYBRID_MAX_PAYLOAD_SIZE 128
 
@@ -127,6 +128,7 @@ PeripheralPoller allPeripheralsPoller = {PERIPHERAL_ID_ALL, 0, 0, 1000, false, f
 
 DataCollector dataCollector;
 CommandQueue commandQueue;
+TransferStats transferStats;
 
 // ====================================================================
 // LOOP PERFORMANCE TRACKING
@@ -198,23 +200,23 @@ void setup() {
     while (!Serial && millis() < 3000) delay(10);
     delay(500);
 
-    // Print banner
-    Serial.println("\n====================================");
-    Serial.println("  ESP32 HYBRID PROTOCOL MODE");
-    Serial.println("  Single-Threaded Event Loop");
-    Serial.println("====================================");
-    Serial.println();
-    Serial.println("Format: <AA55[PID][LEN][PAYLOAD_HEX][CHK]55AA>\\n");
-    Serial.println();
+    // Print banner (debug format so Python can filter it)
+    Serial.println("[INFO] ====================================");
+    Serial.println("[INFO]   ESP32 BINARY PROTOCOL MODE");
+    Serial.println("[INFO]   Single-Threaded Event Loop");
+    Serial.println("[INFO] ====================================");
+    Serial.println("[INFO] Format: <AA55[PID][LEN][PAYLOAD][CHK]55AA>");
+    Serial.println("[INFO] Ready for commands!");
 
     // Initialize data collector (sensors)
     dataCollector.begin();
 
+    // Initialize transfer statistics (persistent storage)
+    transferStats.begin();
+
     // Record boot time
     bootTime = millis();
     lastActivityTime = millis();
-
-    Serial.println("Ready for commands!\n");
 }
 
 // ====================================================================
@@ -254,6 +256,12 @@ void loop() {
         }
     }
 
+    // PRIORITY 6: Save transfer statistics periodically (low priority, non-blocking)
+    // Save every 30 seconds if there are unsaved changes
+    if (transferStats.hasUnsavedChanges() && transferStats.timeSinceLastSave() >= 30000) {
+        transferStats.save();
+    }
+
     // Very small delay to prevent watchdog issues but maximize responsiveness
     // Note: No delay for maximum speed - ESP32 yield() is called automatically
     yield();  // Let ESP32 handle background tasks (WiFi, etc.)
@@ -278,44 +286,44 @@ void readIncomingCommands() {
     while (Serial.available() && rxFrameIndex < HYBRID_MAX_FRAME_SIZE - 1) {
         char c = Serial.read();
 
-        if (c == '\n' || c == '\r') {
+        // Store the byte
+        rxFrameBuffer[rxFrameIndex++] = c;
+
+        // Check if frame is complete (ends with '>')
+        if (c == '>') {
             // Complete frame received!
-            if (rxFrameIndex > 0) {
-                rxFrameBuffer[rxFrameIndex] = '\0';
+            rxFrameBuffer[rxFrameIndex] = '\0';
 
-                // Parse and queue command
-                uint8_t pid, cmd;
-                uint8_t payload[HYBRID_MAX_PAYLOAD_SIZE];
-                uint8_t payloadLen;
+            // Parse and queue command
+            uint8_t pid, cmd;
+            uint8_t payload[HYBRID_MAX_PAYLOAD_SIZE];
+            uint8_t payloadLen;
 
-                if (parseHybridFrame(rxFrameBuffer, &pid, &cmd, payload, &payloadLen)) {
-                    // Valid frame - create command
-                    Command newCmd;
-                    newCmd.peripheralId = pid;
-                    newCmd.command = cmd;
-                    newCmd.payloadLen = min(payloadLen, (uint8_t)sizeof(newCmd.payload));
-                    memcpy(newCmd.payload, payload, newCmd.payloadLen);
+            if (parseHybridFrame(rxFrameBuffer, &pid, &cmd, payload, &payloadLen)) {
+                // Valid frame - create command
+                Command newCmd;
+                newCmd.peripheralId = pid;
+                newCmd.command = cmd;
+                newCmd.payloadLen = min(payloadLen, (uint8_t)sizeof(newCmd.payload));
+                memcpy(newCmd.payload, payload, newCmd.payloadLen);
 
-                    // Queue it (don't execute yet!)
-                    if (commandQueue.enqueue(newCmd)) {
-                        totalCommandsReceived++;
-                        lastActivityTime = millis();
-                    } else {
-                        // Queue full - send error immediately
-                        sendErrorResponse(pid, ERROR_QUEUE_FULL);
-                    }
+                // Queue it (don't execute yet!)
+                if (commandQueue.enqueue(newCmd)) {
+                    totalCommandsReceived++;
+                    lastActivityTime = millis();
                 } else {
-                    // Invalid frame
-                    totalFrameErrors++;
-                    // Could send error response here if we could parse PID
+                    // Queue full - send error immediately
+                    sendErrorResponse(pid, ERROR_QUEUE_FULL);
                 }
-
-                rxFrameIndex = 0;
+            } else {
+                // Invalid frame
+                totalFrameErrors++;
+                // Could send error response here if we could parse PID
             }
+
+            rxFrameIndex = 0;
             return;
         }
-
-        rxFrameBuffer[rxFrameIndex++] = c;
     }
 
     // Timeout check - abandon partial frame after 1 second
@@ -416,6 +424,26 @@ void handleCommand(const Command& cmd) {
             } else {
                 sendErrorResponse(cmd.peripheralId, ERROR_INVALID_CMD);
             }
+            break;
+
+        case CMD_SYSTEM_STATS:
+            // Get transfer statistics (41 bytes)
+            {
+                uint8_t buffer[HYBRID_MAX_PAYLOAD_SIZE];
+                size_t len = transferStats.packStats(buffer, HYBRID_MAX_PAYLOAD_SIZE);
+                if (len > 0) {
+                    sendHybridFrame(PERIPHERAL_ID_SYSTEM, buffer, len);
+                } else {
+                    sendErrorResponse(cmd.peripheralId, ERROR_INVALID_CMD);
+                }
+            }
+            break;
+
+        case CMD_SYSTEM_STATS_RESET:
+            // Reset transfer statistics
+            transferStats.reset();
+            Serial.println("[STATS] Transfer statistics reset by user");
+            sendAckResponse(cmd.peripheralId);
             break;
 
         default:
@@ -519,7 +547,6 @@ void sendAutonomousData() {
     if (allPeripheralsPoller.autonomousSendEnabled) {
         if (now - allPeripheralsPoller.lastSendTime >= allPeripheralsPoller.pollInterval) {
             // Send all peripherals by calling handleGetAllPeripherals
-            Serial.printf("[AUTO] Sending PID_ALL batch\n");
             handleGetAllPeripherals();
             allPeripheralsPoller.lastSendTime = now;
             return;  // Send only one batch per loop iteration
@@ -561,58 +588,75 @@ void sendHybridFrame(uint8_t pid, const uint8_t* payload, size_t len) {
 
     uint8_t chk = calculateChecksum(pid, len, payload);
 
-    // Build frame: <AA55[PID][LEN][PAYLOAD_HEX][CHK]55AA>\n
-    Serial.print('<');
-    Serial.print("AA55");
-    Serial.printf("%02X", pid);
-    Serial.printf("%02X", (uint8_t)len);
+    // Build frame: <AA55[PID][LEN][PAYLOAD][CHK]55AA> (pure binary)
+    Serial.write('<');      // 0x3C
+    Serial.write(0xAA);
+    Serial.write(0x55);
+    Serial.write(pid);
+    Serial.write((uint8_t)len);
 
-    // Payload as hex
-    for (size_t i = 0; i < len; i++) {
-        Serial.printf("%02X", payload[i]);
+    // Payload (raw bytes)
+    if (len > 0) {
+        Serial.write(payload, len);
     }
 
-    Serial.printf("%02X", chk);
-    Serial.print("55AA>\n");
+    Serial.write(chk);
+    Serial.write(0x55);
+    Serial.write(0xAA);
+    Serial.write('>');      // 0x3E
+
+    // Record transfer statistics (frame overhead + payload)
+    // Frame overhead: < AA 55 PID LEN CHK 55 AA > = 9 bytes
+    transferStats.recordTransmission(pid, 9 + len);
 }
 
 bool parseHybridFrame(const char* frame, uint8_t* pid, uint8_t* cmd,
                       uint8_t* payload, uint8_t* payloadLen) {
-    // Expected format: <AA55[PID][LEN][PAYLOAD_HEX][CHK]55AA>
+    // Expected format: <AA55[PID][LEN][PAYLOAD][CHK]55AA> (pure binary)
+    // Convert to uint8_t* for binary access
+    const uint8_t* data = (const uint8_t*)frame;
 
-    // Check frame markers
-    if (frame[0] != '<') {
+    // Find frame length by searching for '>' marker
+    // (can't use strlen because binary data may contain 0x00)
+    size_t frameLen = 0;
+    for (size_t i = 0; i < HYBRID_MAX_FRAME_SIZE; i++) {
+        if (data[i] == '>') {
+            frameLen = i + 1;
+            break;
+        }
+    }
+
+    // Minimum frame: < AA 55 PID LEN CHK 55 AA > = 9 bytes
+    if (frameLen < 9) {
         return false;
     }
 
-    size_t frameLen = strlen(frame);
-    if (frameLen < 12 || frame[frameLen - 1] != '>') {
-        return false;  // Too short or missing '>'
+    // Check frame markers
+    if (data[0] != '<') {
+        return false;
+    }
+    if (data[frameLen - 1] != '>') {
+        return false;
     }
 
     // Check start markers: AA55
-    if (strncmp(frame + 1, "AA55", 4) != 0) {
+    if (data[1] != 0xAA || data[2] != 0x55) {
         return false;
     }
 
-    // Parse PID (2 hex chars)
-    char pidStr[3] = {frame[5], frame[6], '\0'};
-    *pid = (uint8_t)strtol(pidStr, nullptr, 16);
+    // Parse PID and length
+    *pid = data[3];
+    uint8_t len = data[4];
 
-    // Parse length (2 hex chars)
-    char lenStr[3] = {frame[7], frame[8], '\0'};
-    uint8_t len = (uint8_t)strtol(lenStr, nullptr, 16);
-
-    // Check frame length matches
-    size_t expectedLen = 1 + 4 + 2 + 2 + (len * 2) + 2 + 4 + 1;  // <AA55PPLL[data]CHKSUM55AA>
-    if (frameLen < expectedLen) {
+    // Check frame length matches: < AA 55 PID LEN [payload...] CHK 55 AA >
+    size_t expectedLen = 1 + 2 + 1 + 1 + len + 1 + 2 + 1;  // = 9 + len
+    if (frameLen != expectedLen) {
         return false;
     }
 
-    // Parse payload (each byte is 2 hex chars)
+    // Copy payload
     for (uint8_t i = 0; i < len; i++) {
-        char byteStr[3] = {frame[9 + i * 2], frame[10 + i * 2], '\0'};
-        payload[i] = (uint8_t)strtol(byteStr, nullptr, 16);
+        payload[i] = data[5 + i];
     }
     *payloadLen = len;
 
@@ -623,10 +667,8 @@ bool parseHybridFrame(const char* frame, uint8_t* pid, uint8_t* cmd,
         *cmd = 0;
     }
 
-    // Parse checksum (2 hex chars)
-    size_t chkPos = 9 + len * 2;
-    char chkStr[3] = {frame[chkPos], frame[chkPos + 1], '\0'};
-    uint8_t rxChk = (uint8_t)strtol(chkStr, nullptr, 16);
+    // Parse checksum
+    uint8_t rxChk = data[5 + len];
 
     // Verify checksum
     uint8_t calcChk = calculateChecksum(*pid, len, payload);
@@ -634,8 +676,8 @@ bool parseHybridFrame(const char* frame, uint8_t* pid, uint8_t* cmd,
         return false;
     }
 
-    // Check end markers: 55AA
-    if (strncmp(frame + chkPos + 2, "55AA", 4) != 0) {
+    // Check end markers: 55 AA
+    if (data[6 + len] != 0x55 || data[7 + len] != 0xAA) {
         return false;
     }
 
@@ -745,7 +787,6 @@ void enableAutonomousSend(uint8_t pid, uint16_t interval) {
         if (interval > 0) {
             allPeripheralsPoller.pollInterval = interval;
         }
-        Serial.printf("[AUTO] PID=0x%02X (ALL) interval=%ums\n", pid, allPeripheralsPoller.pollInterval);
         return;
     }
 
@@ -758,8 +799,6 @@ void enableAutonomousSend(uint8_t pid, uint16_t interval) {
         if (interval > 0) {
             poller->pollInterval = interval;
         }
-        // Debug: Show what was configured
-        Serial.printf("[AUTO] PID=0x%02X interval=%ums\n", pid, poller->pollInterval);
     }
 }
 

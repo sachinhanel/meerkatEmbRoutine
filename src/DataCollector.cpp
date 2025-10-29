@@ -163,11 +163,8 @@ void DataCollector::updateSystemStatus() {
     system_status.barometer_online = barometer->isOnline();
     system_status.current_sensor_online = current_sensor->isOnline();
 #else
-    // In test mode, keep counters for fake data
-    static uint16_t test_lora_count = 0;
-    static uint16_t test_433_count = 0;
-    system_status.packet_count_lora = test_lora_count++;
-    system_status.packet_count_433 = test_433_count++;
+    // In test mode, counters are updated in packLoRaData() and pack433Data()
+    // Don't increment here to avoid false counts on status requests
 #endif
 }
 
@@ -207,6 +204,8 @@ size_t DataCollector::packLoRaData(uint8_t* out, size_t max_len) {
     w.version = 1;
     static uint16_t test_packet_count = 0;
     w.packet_count = test_packet_count++;
+    // Also update system status counter to match
+    system_status.packet_count_lora = w.packet_count;
     w.rssi_dbm = -85;
     w.snr_db = 3.5;
     const char* test_data = "TestLoRaPacket";
@@ -244,6 +243,8 @@ size_t DataCollector::pack433Data(uint8_t* out, size_t max_len) {
     w.version = 1;
     static uint16_t test_packet_count = 0;
     w.packet_count = test_packet_count++;
+    // Also update system status counter to match
+    system_status.packet_count_433 = w.packet_count;
     w.rssi_dbm = -92;
     const char* test_data = "Test433Packet";
     w.latest_len = strlen(test_data);
