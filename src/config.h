@@ -167,6 +167,7 @@
 #define CMD_SYSTEM_WAKEUP   0x21  // Wake up system from low-power state
 #define CMD_SYSTEM_SLEEP    0x22  // Put system into low-power state
 #define CMD_SYSTEM_RESET    0x23  // Reset entire ESP32
+#define CMD_SYSTEM_PERF     0x24  // Toggle performance stats output (payload: 1 byte, 0=off, 1=on)
 // 0x24-0x2F reserved for future system commands
 
 // ====================================================================

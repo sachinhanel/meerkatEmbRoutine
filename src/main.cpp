@@ -138,9 +138,10 @@ struct LoopStats {
     uint32_t lastLoopTime;
     float loopsPerSecond;
     float avgLoopTimeMs;
+    bool enabled;  // Toggle performance stats output
 };
 
-LoopStats loopStats = {0, 0, 0, 0.0f, 0.0f};
+LoopStats loopStats = {0, 0, 0, 0.0f, 0.0f, false};  // Disabled by default
 
 // Serial receive buffer (static for state machine)
 static char rxFrameBuffer[HYBRID_MAX_FRAME_SIZE];
@@ -235,21 +236,23 @@ void loop() {
     // PRIORITY 4: Send autonomous data if enabled
     sendAutonomousData();
 
-    // PRIORITY 5: Report loop performance stats (twice per second) - DISABLED FOR NOW
-    // loopStats.loopCount++;
-    // uint32_t now = millis();
-    // if (now - loopStats.lastReportTime >= 500) {  // Report every 500ms (2x per second)
-    //     uint32_t elapsed = now - loopStats.lastReportTime;
-    //     loopStats.loopsPerSecond = (loopStats.loopCount * 1000.0f) / elapsed;
-    //     loopStats.avgLoopTimeMs = elapsed / (float)loopStats.loopCount;
+    // PRIORITY 5: Report loop performance stats (twice per second, if enabled)
+    if (loopStats.enabled) {
+        loopStats.loopCount++;
+        uint32_t now = millis();
+        if (now - loopStats.lastReportTime >= 500) {  // Report every 500ms (2x per second)
+            uint32_t elapsed = now - loopStats.lastReportTime;
+            loopStats.loopsPerSecond = (loopStats.loopCount * 1000.0f) / elapsed;
+            loopStats.avgLoopTimeMs = elapsed / (float)loopStats.loopCount;
 
-    //     // Send performance stats as a special message
-    //     Serial.printf("[PERF] %.1f loops/sec, %.3f ms/loop, Queue: %d/8\n",
-    //         loopStats.loopsPerSecond, loopStats.avgLoopTimeMs, commandQueue.size());
+            // Send performance stats as a special message
+            Serial.printf("[PERF] %.1f loops/sec, %.3f ms/loop, Queue: %d/8\n",
+                loopStats.loopsPerSecond, loopStats.avgLoopTimeMs, commandQueue.size());
 
-    //     loopStats.loopCount = 0;
-    //     loopStats.lastReportTime = now;
-    // }
+            loopStats.loopCount = 0;
+            loopStats.lastReportTime = now;
+        }
+    }
 
     // Very small delay to prevent watchdog issues but maximize responsiveness
     // Note: No delay for maximum speed - ESP32 yield() is called automatically
@@ -400,6 +403,19 @@ void handleCommand(const Command& cmd) {
         case CMD_SYSTEM_WAKEUP:
             // Send system status (system commands)
             sendSystemStatus();
+            break;
+
+        case CMD_SYSTEM_PERF:
+            // Toggle performance stats output
+            // Payload: 1 byte (0=disable, 1=enable)
+            if (cmd.payloadLen >= 2) {  // Command byte + 1 data byte
+                uint8_t enableFlag = cmd.payload[1];
+                loopStats.enabled = (enableFlag != 0);
+                Serial.printf("[PERF] Performance stats %s\n", loopStats.enabled ? "ENABLED" : "DISABLED");
+                sendAckResponse(cmd.peripheralId);
+            } else {
+                sendErrorResponse(cmd.peripheralId, ERROR_INVALID_CMD);
+            }
             break;
 
         default:

@@ -84,6 +84,7 @@ SYSTEM_COMMANDS = {
     "SYSTEM_WAKEUP":  0x21,
     "SYSTEM_SLEEP":   0x22,
     "SYSTEM_RESET":   0x23,
+    "SYSTEM_PERF":    0x24,  # Toggle performance stats (payload: 0=off, 1=on)
 }
 
 # Data structure sizes (for validation and parsing)
@@ -428,6 +429,8 @@ class HybridProtocolGUI:
             ("Start LoRa Poll (1s)", lambda: self.start_polling("LORA_915", 1000)),
             ("Start Baro Poll (500ms)", lambda: self.start_polling("BAROMETER", 500)),
             ("Stop All Polling", self.stop_all_polling),
+            ("Enable Perf Stats", lambda: self.toggle_perf_stats(True)),
+            ("Disable Perf Stats", lambda: self.toggle_perf_stats(False)),
         ]
 
         for text, cmd in buttons:
@@ -613,6 +616,24 @@ class HybridProtocolGUI:
         self.log(f"     {frame.decode('ascii').strip()}", "tx")
         self.log(f"     Started polling every {interval_ms}ms", "info")
 
+    def toggle_perf_stats(self, enable):
+        """Enable or disable performance stats output"""
+        if not self.connected:
+            messagebox.showwarning("Not Connected", "Please connect to serial port first")
+            return
+
+        peripheral_id = PERIPHERALS["SYSTEM"]
+        command = SYSTEM_COMMANDS["SYSTEM_PERF"]
+
+        payload = bytearray([command])
+        payload.append(1 if enable else 0)  # 1=enable, 0=disable
+
+        frame = encode_hybrid_frame(peripheral_id, bytes(payload))
+        self.ser.write(frame)
+
+        self.log(f"[TX] SYSTEM → SYSTEM_PERF ({'ENABLE' if enable else 'DISABLE'})", "tx")
+        self.log(f"     {frame.decode('ascii').strip()}", "tx")
+
     def stop_all_polling(self):
         """Stop autonomous polling for all peripherals"""
         if not self.connected:
@@ -647,8 +668,12 @@ class HybridProtocolGUI:
                         if line_str.startswith('[PERF]'):
                             self.parse_perf_stats(line_str)
                             continue
-                        elif line_str.startswith('[DEBUG]'):
+                        elif line_str.startswith('[DEBUG]') or line_str.startswith('[AUTO]') or line_str.startswith('[RATE_LIMIT]'):
                             # Show debug messages in log
+                            self.log(line_str, "info")
+                            continue
+                        elif line_str.startswith('[SEND]'):
+                            # Show send timing debug in log
                             self.log(line_str, "info")
                             continue
 
