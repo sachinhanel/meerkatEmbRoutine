@@ -34,104 +34,59 @@
 // Current Sensor Pin (Analog)
 #define CURRENT_SENSOR_PIN 10 // might be wrong
 
-// Raspberry Pi Communication  uses GPIO 19/20 instead now, which is usb and doenst need to be set
-// #define PI_UART_TX      43
-// #define PI_UART_RX      44
-// #define PI_UART_BAUD    115200
+// Raspberry Pi Communication
+// Uses GPIO 19/20 (USB serial), configured automatically by Arduino framework
+// Baud rate: 115200 (set in main.cpp)
 
-// WiFi Configuration (for remote monitoring in TEST_MODE)
+// WiFi Configuration (optional, for remote debugging)
 #define WIFI_SSID       "Telstra1842A7_EXT"
 #define WIFI_PASSWORD   "hpr9a26puk"
 #define TELNET_PORT     23
 
-//OTHER DEVICES TO BE ADDED
-//1. ERROR LED, POWER LED
-//2. AIM BOARD COMMUNICATION PINS TO BACKPLANE
-//3. SD CARD (doesnt need to be read from the pi but needs to make sure that there is adequate space to log data, throw erorr or delete old fils automatically if not enough space)
-
-
-//THINGS TO DO
-//NEED TO CHANGE THE 915 AND 433 TO SEND THROUGH BINARY RATHER THAN JSON, AS JSON IS TOO SLOW, PERHAPS CHANGE THE OTHER PERIPHELS OR KEEP THE SAME
-//CURRENT NEEDS VOLTAGE ALSO
-
-//
-
-
+// Future Expansion:
+// - Status LEDs (error, power indicators)
+// - AIM board communication (backplane interface)
+// - SD card logging (with automatic space management)
 
 
 // ====================================================================
-// COMMUNICATION PROTOCOL ARCHITECTURE
+// HYBRID PROTOCOL - Binary + ASCII Hex Framing + Newline
 // ====================================================================
 //
-// PROTOCOL STRUCTURE:
-// -------------------
-// All messages follow this framing structure:
+// Format: <AA55[PID][LEN][PAYLOAD_HEX][CHK]55AA>\n
 //
-//   Pi → ESP32 (Command):
-//   [HELLO_BYTE] [PERIPHERAL_ID] [LENGTH] [PAYLOAD...] [GOODBYE_BYTE]
+// Frame Structure:
+//   '<'          - Start marker (1 byte ASCII)
+//   'AA55'       - Protocol header (4 bytes ASCII hex)
+//   [PID]        - Peripheral ID (2 bytes ASCII hex, e.g., "01" = 0x01)
+//   [LEN]        - Payload length (2 bytes ASCII hex, e.g., "4A" = 74 bytes)
+//   [PAYLOAD]    - Payload data (LEN*2 bytes ASCII hex, e.g., "0123" = 0x01,0x23)
+//   [CHK]        - Checksum: PID ^ LEN ^ payload bytes (2 bytes ASCII hex)
+//   '55AA'       - Protocol footer (4 bytes ASCII)
+//   '>'          - End marker (1 byte ASCII)
+//   '\n'         - Newline terminator
 //
-//   ESP32 → Pi (Response):
-//   [RESPONSE_BYTE] [PERIPHERAL_ID] [LENGTH] [PAYLOAD...] [GOODBYE_BYTE]
+// Benefits:
+//   - Human-readable in terminal/serial monitor
+//   - Binary data encoded as ASCII hex
+//   - Newline-delimited for easy parsing
+//   - Checksum for error detection
 //
-// FRAMING BYTES:
-//   - HELLO_BYTE (0x7E):    Start of Pi→ESP32 message
-//   - RESPONSE_BYTE (0x7D): Start of ESP32→Pi message (different to avoid echo)
-//   - GOODBYE_BYTE (0x7F):  End of message marker
+// Examples:
+//   Get LoRa data:  <AA55010100010155AA>
+//   Response:       <AA550104A[148 hex chars]XX55AA>
+//   Error response: <AA5501 02FF04XX55AA> (FF = error, 04 = invalid PID)
 //
-// PERIPHERAL_ID (1 byte):
-//   - Identifies which device/subsystem this message is for
-//   - Range 0x00-0xFF
-//   - 0x00 = System (ESP32 itself)
-//   - 0x01-0x0F = Sensors/peripherals
-//   - 0x10-0x1F = AIM boards or future expansion
+// Payload Format:
+//   First byte: Command byte (0x00-0xFF)
+//   Remaining bytes: Command-specific parameters or response data
 //
-// LENGTH (1 byte):
-//   - Number of payload bytes (0-255)
-//   - Does NOT include framing bytes, peripheral_id, or length itself
-//
-// PAYLOAD:
-//   - First byte is typically a COMMAND (what to do)
-//   - Remaining bytes are command-specific data (if any)
-//   - For responses, contains the requested data
-//
-// ====================================================================
-// MODULAR COMMAND ARCHITECTURE:
-// ====================================================================
-//
-// Each peripheral has ONE peripheral_id, and processes its own commands.
-// This makes the system modular - each device is self-contained.
-//
-// COMMAND BYTE (first byte of payload):
+// Command Ranges:
 //   0x00-0x0F: Generic commands (work for ALL peripherals)
-//   0x10-0x1F: Peripheral-specific commands (defined per device)
-//   0x20-0xFF: Reserved for system-level or special commands
-//
-// EXAMPLES:
-// ---------
-// 1. Get all data from LoRa module:
-//    Pi→ESP32: [0x7E][0x01][0x01][0x00][0x7F]
-//              HELLO  LORA  len=1 GET_ALL GOODBYE
-//    ESP32→Pi: [0x7D][0x01][0x4A][<74 bytes WireLoRa_t>][0x7F]
-//              RESP   LORA  len=74  data               GOODBYE
-//
-// 2. Wake up the system:
-//    Pi→ESP32: [0x7E][0x00][0x01][0x20][0x7F]
-//              HELLO  SYS   len=1 WAKEUP GOODBYE
-//    ESP32→Pi: [0x7D][0x00][0x01][0x20][0x7F]
-//              RESP   SYS   len=1 ACK    GOODBYE
-//
-// 3. Get barometer data:
-//    Pi→ESP32: [0x7E][0x03][0x01][0x00][0x7F]
-//              HELLO  BARO  len=1 GET_ALL GOODBYE
-//    ESP32→Pi: [0x7D][0x03][0x11][<17 bytes WireBarometer_t>][0x7F]
-//              RESP   BARO  len=17  data                    GOODBYE
+//   0x10-0x1F: Peripheral-specific commands
+//   0x20-0x2F: System commands (only for PID=0x00)
 //
 // ====================================================================
-
-// Communication Protocol Constants
-#define HELLO_BYTE      0x7E  // Pi → ESP32 command start
-#define RESPONSE_BYTE   0x7D  // ESP32 → Pi response start (different from HELLO to avoid echo confusion)
-#define GOODBYE_BYTE    0x7F  // End of message marker
 
 // ====================================================================
 // PERIPHERAL IDs - One ID per device/subsystem
@@ -168,7 +123,7 @@
 #define CMD_SYSTEM_SLEEP    0x22  // Put system into low-power state
 #define CMD_SYSTEM_RESET    0x23  // Reset entire ESP32
 #define CMD_SYSTEM_PERF     0x24  // Toggle performance stats output (payload: 1 byte, 0=off, 1=on)
-// 0x24-0x2F reserved for future system commands
+// 0x25-0x2F reserved for future system commands
 
 // ====================================================================
 // PERIPHERAL-SPECIFIC COMMANDS (0x10-0x1F) - Future expansion
