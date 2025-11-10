@@ -261,7 +261,7 @@ python test/interactive_sender.py
 
 ### Serial Connection Issues
 - Verify correct COM port selected
-- Ensure 115200 baud rate
+- Ensure identical baud rate setting between embedded system and sender
 - Check ESP32 powered and running (LED should be on)
 - Try unplugging/replugging USB cable
 
