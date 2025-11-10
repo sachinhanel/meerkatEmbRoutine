@@ -310,9 +310,6 @@ This is an academic/research project. If you find issues or have suggestions:
 2. Create detailed bug report with logs
 3. Include ESP32 board variant and sensor configuration
 
-## License
-
-[Add your license here]
 
 ## Acknowledgments
 
@@ -323,4 +320,4 @@ This is an academic/research project. If you find issues or have suggestions:
 
 ## Contact
 
-[Add your contact information or university affiliation]
+https://www.linkedin.com/in/sachinhanel/
