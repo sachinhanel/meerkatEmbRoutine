@@ -39,8 +39,8 @@
 // Baud rate: 115200 (set in main.cpp)
 
 // WiFi Configuration (optional, for remote debugging)
-#define WIFI_SSID       "Telstra1842A7_EXT"
-#define WIFI_PASSWORD   "hpr9a26puk"
+#define WIFI_SSID       "null"
+#define WIFI_PASSWORD   "null"
 #define TELNET_PORT     23
 
 // Future Expansion:

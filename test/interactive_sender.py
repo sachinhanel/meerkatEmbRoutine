@@ -399,9 +399,9 @@ class HybridProtocolGUI:
         ttk.Button(conn_frame, text="Refresh", command=self.refresh_ports).grid(row=0, column=2, padx=5)
 
         ttk.Label(conn_frame, text="Baud:").grid(row=0, column=3, padx=5, sticky=tk.W)
-        self.baud_var = tk.StringVar(value="115200")
+        self.baud_var = tk.StringVar(value="921600")
         baud_combo = ttk.Combobox(conn_frame, textvariable=self.baud_var, width=10,
-                                  values=["9600", "115200", "230400", "460800"], state='readonly')
+                                  values=["9600", "115200", "230400", "460800", "921600"], state='readonly')
         baud_combo.grid(row=0, column=4, padx=5)
 
         self.connect_btn = ttk.Button(conn_frame, text="Connect", command=self.toggle_connection)
