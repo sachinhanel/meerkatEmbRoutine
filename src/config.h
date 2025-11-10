@@ -1,6 +1,14 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+// ====================================================================
+// ESP32 Single-Threaded Firmware Configuration
+// ====================================================================
+// This firmware uses a priority-based event loop with command queue
+// - No FreeRTOS tasks
+// - Hybrid protocol only (binary + newline framing)
+// - Non-blocking peripheral polling
+
 // Pin Definitions for ESP32-S3
 // SPI Pins (shared between LoRa and 433MHz modules)
 #define SPI_SCK_PIN     11
@@ -26,55 +34,113 @@
 // Current Sensor Pin (Analog)
 #define CURRENT_SENSOR_PIN 10 // might be wrong
 
-// Raspberry Pi Communication  uses GPIO 19/20 instead now, which is usb and doenst need to be set
+// Raspberry Pi Communication
+// Uses GPIO 19/20 (USB serial), configured automatically by Arduino framework
+// Baud rate: 115200 (set in main.cpp)
+
+// WiFi Configuration (optional, for remote debugging)
+#define WIFI_SSID       "null"
+#define WIFI_PASSWORD   "null"
+#define TELNET_PORT     23
+
+// Future Expansion:
+// - Status LEDs (error, power indicators)
+// - AIM board communication (backplane interface)
+// - SD card logging (with automatic space management)
 
 
-// #define PI_UART_TX      43
-// #define PI_UART_RX      44
-// #define PI_UART_BAUD    115200
-
-//OTHER DEVICES TO BE ADDED
-//1. ERROR LED, POWER LED
-//2. AIM BOARD COMMUNICATION PINS TO BACKPLANE
-//3. SD CARD (doesnt need to be read from the pi but needs to make sure that there is adequate space to log data, throw erorr or delete old fils automatically if not enough space)
-
-
-//THINGS TO DO
-//NEED TO CHANGE THE 915 AND 433 TO SEND THROUGH BINARY RATHER THAN JSON, AS JSON IS TOO SLOW, PERHAPS CHANGE THE OTHER PERIPHELS OR KEEP THE SAME
-//CURRENT NEEDS VOLTAGE ALSO
-
+// ====================================================================
+// HYBRID PROTOCOL - Binary with Frame Markers
+// ====================================================================
 //
+// Format: <AA55[PID][LEN][PAYLOAD][CHK]55AA>
+//
+// Frame Structure (Pure Binary):
+//   '<'          - Start marker (0x3C)
+//   0xAA 0x55    - Protocol header (2 bytes)
+//   [PID]        - Peripheral ID (1 byte, e.g., 0x01 = LoRa)
+//   [LEN]        - Payload length (1 byte, 0-255)
+//   [PAYLOAD]    - Payload data (LEN bytes, raw binary)
+//   [CHK]        - Checksum: PID ^ LEN ^ payload bytes (1 byte)
+//   0x55 0xAA    - Protocol footer (2 bytes)
+//   '>'          - End marker (0x3E)
+//
+// Total frame size: 9 + LEN bytes
+//
+// Benefits:
+//   - Compact: ~50% smaller than ASCII hex encoding
+//   - Fast: No encoding/decoding overhead
+//   - Reliable: Frame markers + checksum
+//   - Delimitable: < and > markers for frame boundaries
+//
+// Examples (shown as hex bytes):
+//   Get LoRa:  3C AA 55 01 01 00 01 55 AA 3E (10 bytes)
+//   Response:  3C AA 55 01 4A [74 bytes] XX 55 AA 3E (83 bytes)
+//   Error:     3C AA 55 01 02 FF 04 XX 55 AA 3E (11 bytes)
+//
+// Payload Format:
+//   First byte: Command byte (0x00-0xFF)
+//   Remaining bytes: Command-specific parameters or response data
+//
+// Command Ranges:
+//   0x00-0x0F: Generic commands (work for ALL peripherals)
+//   0x10-0x1F: Peripheral-specific commands
+//   0x20-0x2F: System commands (only for PID=0x00)
+//
+// ====================================================================
 
+// ====================================================================
+// PERIPHERAL IDs - One ID per device/subsystem
+// ====================================================================
+#define PERIPHERAL_ID_SYSTEM        0x00  // ESP32 system control
+#define PERIPHERAL_ID_LORA_915      0x01  // 915MHz LoRa module
+#define PERIPHERAL_ID_LORA_433      0x02  // 433MHz LoRa module (same chip as 915, different freq)
+#define PERIPHERAL_ID_BAROMETER     0x03  // MS5607 barometer
+#define PERIPHERAL_ID_CURRENT       0x04  // Current/voltage sensor
+#define PERIPHERAL_ID_AIM_1         0x10  // AIM board 1 (future)
+#define PERIPHERAL_ID_AIM_2         0x11  // AIM board 2 (future)
+#define PERIPHERAL_ID_AIM_3         0x12  // AIM board 3 (future)
+#define PERIPHERAL_ID_AIM_4         0x13  // AIM board 4 (future)
+#define PERIPHERAL_ID_ALL           0xFF  // Special ID: targets all sensor peripherals
 
+// Backward compatibility alias
+#define PERIPHERAL_ID_RADIO_433     PERIPHERAL_ID_LORA_433
 
+// ====================================================================
+// GENERIC COMMANDS - Work for SENSOR peripherals ONLY (0x00-0x0F)
+// NOT for SYSTEM peripheral (use 0x20-0x2F for system commands)
+// ====================================================================
+#define CMD_GET_ALL         0x00  // Get all available data from this peripheral (one-time)
+#define CMD_GET_STATUS      0x01  // Get status/health of this peripheral
+#define CMD_SET_POLL_RATE   0x02  // Set autonomous polling rate (payload: 2 bytes interval_ms)
+#define CMD_STOP_POLL       0x03  // Stop autonomous polling (no payload)
+// 0x04-0x0F reserved for future generic commands
 
-// Communication Protocol Constants
-#define HELLO_BYTE      0x7E
-#define GOODBYE_BYTE    0x7F
+// ====================================================================
+// SYSTEM COMMANDS - Only for PERIPHERAL_ID_SYSTEM (0x20-0x2F)
+// ====================================================================
+#define CMD_SYSTEM_STATUS   0x20  // Get full WireStatus_t (20 bytes)
+#define CMD_SYSTEM_WAKEUP   0x21  // Wake up system from low-power state
+#define CMD_SYSTEM_SLEEP    0x22  // Put system into low-power state
+#define CMD_SYSTEM_RESET    0x23  // Reset entire ESP32
+#define CMD_SYSTEM_PERF     0x24  // Toggle performance stats output (payload: 1 byte, 0=off, 1=on)
+#define CMD_SYSTEM_STATS    0x25  // Get transfer statistics (WireTransferStats_t, 41 bytes)
+#define CMD_SYSTEM_STATS_RESET 0x26  // Reset transfer statistics
+// 0x27-0x2F reserved for future system commands
 
-// Peripheral/Origin IDs
-#define PERIPHERAL_ID_SYSTEM        0x00
-#define PERIPHERAL_ID_LORA_915      0x01
-#define PERIPHERAL_ID_RADIO_433     0x02
-#define PERIPHERAL_ID_BAROMETER     0x03
-#define PERIPHERAL_ID_CURRENT       0x04
-#define PERIPHERAL_ID_EXTERNAL_1    0x10  // For future plug-in modules
-#define PERIPHERAL_ID_EXTERNAL_2    0x11
-#define PERIPHERAL_ID_EXTERNAL_3    0x12
-
-// System Commands (PERIPHERAL_ID_SYSTEM)
-#define CMD_SYSTEM_WAKEUP           0x01
-#define CMD_SYSTEM_STATUS           0x02
-#define CMD_SYSTEM_SLEEP            0x03
-#define CMD_SYSTEM_RESET            0x04
-
-// Data Request Commands
-#define CMD_GET_LORA_DATA       0x01
-#define CMD_GET_433_DATA        0x02
-#define CMD_GET_BAROMETER_DATA  0x03
-#define CMD_GET_CURRENT_DATA    0x04
-#define CMD_GET_ALL_DATA        0x05
-#define CMD_GET_STATUS          0x06
+// ====================================================================
+// PERIPHERAL-SPECIFIC COMMANDS (0x10-0x1F) - Future expansion
+// ====================================================================
+// Each peripheral can define its own commands starting at 0x10
+// Example for future LoRa-specific commands:
+// #define CMD_LORA_GET_SNR        0x10  // Get only SNR value
+// #define CMD_LORA_GET_RSSI       0x11  // Get only RSSI value
+// #define CMD_LORA_SET_FREQUENCY  0x12  // Change frequency (payload: freq)
+//
+// Example for future barometer-specific commands:
+// #define CMD_BARO_GET_PRESSURE   0x10  // Get only pressure
+// #define CMD_BARO_GET_TEMP       0x11  // Get only temperature
+// #define CMD_BARO_CALIBRATE      0x12  // Calibrate sensor
 
 // Buffer Sizes
 #define LORA_BUFFER_SIZE        256
@@ -86,17 +152,19 @@
 #define RADIO_LISTEN_TIMEOUT    50
 #define PI_COMM_TIMEOUT         1000
 
-// LoRa Configuration
+// LoRa 915MHz Configuration
 #define LORA_FREQUENCY          915E6
 #define LORA_BANDWIDTH          125E3
 #define LORA_SPREADING_FACTOR   7
 #define LORA_CODING_RATE        5
 #define LORA_TX_POWER           17
 
-// 433MHz Radio Configuration
-#define RADIO433_FREQUENCY      433.0
-#define RADIO433_BITRATE        4.8
-#define RADIO433_FREQ_DEV       5.0
+// 433MHz LoRa Configuration (same chip as 915MHz, different frequency)
+#define RADIO433_FREQUENCY      433E6  // 433MHz in Hz
+#define RADIO433_BANDWIDTH      125E3  // Same as 915MHz
+#define RADIO433_SPREADING_FACTOR   7  // Same as 915MHz
+#define RADIO433_CODING_RATE    5      // Same as 915MHz
+#define RADIO433_TX_POWER       17     // Same as 915MHz
 
 // System State (added)
 typedef enum {
@@ -129,9 +197,11 @@ typedef struct {
     uint8_t data[MAX_PACKET_SIZE];
 } LoRaPacket_t;
 
+// 433MHz module is also LoRa (same chip, different frequency)
 typedef struct {
     uint32_t timestamp;
     int16_t rssi;
+    float snr;  // LoRa has SNR
     uint8_t data_length;
     uint8_t data[MAX_PACKET_SIZE];
 } Radio433Packet_t;
@@ -170,13 +240,15 @@ typedef struct PACKED {
     uint8_t latest_data[64];   // 64
 } WireLoRa_t;                   // = 74 bytes
 
+// 433MHz LoRa module uses same structure as 915MHz (same chip, different frequency)
 typedef struct PACKED {
     uint8_t version;           // 1
     uint16_t packet_count;     // 2
     int16_t rssi_dbm;          // 2
+    float snr_db;              // 4  (LoRa has SNR)
     uint8_t latest_len;        // 1
     uint8_t latest_data[64];   // 64
-} Wire433_t;                    // = 70 bytes
+} Wire433_t;                    // = 74 bytes (same as WireLoRa_t)
 
 typedef struct PACKED {
     uint8_t version;           // 1
@@ -194,6 +266,12 @@ typedef struct PACKED {
     float power_w;             // 4
     int16_t raw_adc;           // 2
 } WireCurrent_t;                // = 19 bytes
+
+typedef struct PACKED {
+    uint8_t version;           // 1
+    uint32_t uptime_seconds;   // 4
+    uint8_t system_state;      // 1
+} WireHeartbeat_t;              // = 6 bytes (minimal "I'm alive" message)
 
 typedef struct PACKED {
     uint8_t version;           // 1
